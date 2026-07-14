@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}Customers - BillDesk{% endblock %}
+
+{% block content %}
+  <div class="page-header">
+    <h1>Customers</h1>
+    <button class="btn btn-primary" id="btn-new-customer">+ Add Customer</button>
+  </div>
+
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Name</th>
+        <th>Email</th>
+        <th>Phone</th>
+        <th>Address</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody id="customers-tbody">
+      <!-- rows injected by customers.js -->
+    </tbody>
+  </table>
+  <p id="customers-empty" class="empty-state" style="display:none;">No customers yet. Add your first one above.</p>
+
+  <!-- Add / Edit modal -->
+  <div id="customer-modal" class="modal-overlay" style="display:none;">
+    <div class="modal">
+      <h2 id="customer-modal-title">Add Customer</h2>
+      <form id="customer-form">
+        <input type="hidden" id="customer-id">
+        <label>Name *
+          <input type="text" id="customer-name" required>
+        </label>
+        <label>Email
+          <input type="email" id="customer-email">
+        </label>
+        <label>Phone
+          <input type="text" id="customer-phone">
+        </label>
+        <label>Address
+          <textarea id="customer-address" rows="2"></textarea>
+        </label>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-secondary" id="btn-cancel-customer">Cancel</button>
+          <button type="submit" class="btn btn-primary">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+{% endblock %}
+
+{% block scripts %}
+  <script src="{{ url_for('static', filename='js/customers.js') }}"></script>
+{% endblock %}
