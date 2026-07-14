@@ -1,0 +1,15 @@
+# Virtual environment
+venv/
+env/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Database (auto-created by app.py on first run — don't commit local data)
+billing.db
+
+# Editor / OS junk
+.vscode/
+.idea/
+.DS_Store
