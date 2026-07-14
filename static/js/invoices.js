@@ -30,6 +30,7 @@ function renderInvoices(invoices) {
       <td>${inv.invoice_date}</td>
       <td>${inv.due_date}</td>
       <td>${formatCurrency(inv.total)}</td>
+      <td>${formatCurrency(inv.amount_due)}</td>
       <td><span class="badge badge-${inv.status}">${inv.status}</span></td>
       <td>
         <a class="btn btn-secondary btn-small" href="/invoices/${inv.id}/edit">Edit</a>
@@ -78,5 +79,12 @@ searchInput.addEventListener("input", () => {
   debounceTimer = setTimeout(loadInvoices, 300);
 });
 statusSelect.addEventListener("change", loadInvoices);
+
+document.getElementById("btn-export-csv").addEventListener("click", () => {
+  const params = new URLSearchParams();
+  if (searchInput.value.trim()) params.set("search", searchInput.value.trim());
+  if (statusSelect.value) params.set("status", statusSelect.value);
+  window.location.href = `/api/invoices/export?${params.toString()}`;
+});
 
 loadInvoices();

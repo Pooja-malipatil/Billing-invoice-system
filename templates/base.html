@@ -13,6 +13,12 @@
       <a href="/" class="{{ 'active' if request.path == '/' else '' }}">Dashboard</a>
       <a href="/customers" class="{{ 'active' if request.path == '/customers' else '' }}">Customers</a>
       <a href="/invoices" class="{{ 'active' if request.path.startswith('/invoices') else '' }}">Invoices</a>
+      {% if is_logged_in %}
+        <span class="nav-user">👤 {{ username }}</span>
+        <form method="POST" action="/logout" style="display:inline;">
+          <button type="submit" class="btn btn-secondary btn-small">Log out</button>
+        </form>
+      {% endif %}
     </div>
   </nav>
 

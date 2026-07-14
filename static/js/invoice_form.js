@@ -75,6 +75,8 @@ async function loadExistingInvoice() {
 
   removeAllRows();
   invoice.items.forEach((item) => addItemRow(item));
+
+  renderPayments(invoice.payments, invoice.total);
 }
 
 function setDefaultDates() {
@@ -122,6 +124,68 @@ form.addEventListener("submit", async (e) => {
     showToast(err.message, true);
   }
 });
+
+// ---- Payments (only present when editing an existing invoice) --------
+function renderPayments(payments, total) {
+  const tbody = document.getElementById("payments-tbody");
+  const emptyState = document.getElementById("payments-empty");
+  if (!tbody) return; // new-invoice page has no payments section
+
+  tbody.innerHTML = "";
+  emptyState.style.display = payments.length === 0 ? "block" : "none";
+
+  payments.forEach((p) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${p.paid_on}</td>
+      <td>${formatCurrency(p.amount)}</td>
+      <td>${escapeHtml(p.note || "")}</td>
+      <td><button type="button" class="btn btn-danger btn-small" data-delete-payment="${p.id}">Delete</button></td>
+    `;
+    tbody.appendChild(tr);
+  });
+
+  tbody.querySelectorAll("[data-delete-payment]").forEach((btn) => {
+    btn.addEventListener("click", () => deletePayment(btn.dataset.deletePayment));
+  });
+
+  const amountPaid = payments.reduce((sum, p) => sum + p.amount, 0);
+  document.getElementById("amount-paid").textContent = formatCurrency(amountPaid);
+  document.getElementById("amount-due").textContent = formatCurrency(total - amountPaid);
+}
+
+async function deletePayment(id) {
+  if (!confirm("Delete this payment record?")) return;
+  try {
+    await apiFetch(`/api/payments/${id}`, { method: "DELETE" });
+    showToast("Payment deleted");
+    await loadExistingInvoice();
+  } catch (err) {
+    showToast(err.message, true);
+  }
+}
+
+const paymentForm = document.getElementById("payment-form");
+if (paymentForm) {
+  document.getElementById("payment-date").value = new Date().toISOString().split("T")[0];
+  paymentForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const payload = {
+      amount: parseFloat(document.getElementById("payment-amount").value),
+      paid_on: document.getElementById("payment-date").value,
+      note: document.getElementById("payment-note").value.trim(),
+    };
+    try {
+      await apiFetch(`/api/invoices/${invoiceId}/payments`, { method: "POST", body: JSON.stringify(payload) });
+      showToast("Payment recorded");
+      paymentForm.reset();
+      document.getElementById("payment-date").value = new Date().toISOString().split("T")[0];
+      await loadExistingInvoice();
+    } catch (err) {
+      showToast(err.message, true);
+    }
+  });
+}
 
 // ---- Init -----------------------------------------------------------------
 (async function init() {
