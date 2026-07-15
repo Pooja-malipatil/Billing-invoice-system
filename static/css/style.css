@@ -177,6 +177,40 @@ input, select, textarea {
 .totals-box div { display: flex; justify-content: space-between; padding: 4px 0; }
 .totals-box .total-line { font-weight: 700; border-top: 1px solid var(--border); margin-top: 6px; padding-top: 8px; }
 
+/* ---------- Auth pages (login/register) ---------- */
+.auth-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+}
+.auth-card {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 32px;
+  width: 100%;
+  max-width: 360px;
+}
+.auth-card h1 { margin: 0 0 4px; font-size: 1.4rem; text-align: center; }
+.auth-card .subtitle { text-align: center; margin-top: 0; margin-bottom: 20px; }
+.auth-card form { display: flex; flex-direction: column; gap: 14px; }
+.auth-error {
+  background: #fee2e2;
+  color: var(--danger);
+  padding: 8px 12px;
+  border-radius: var(--radius);
+  font-size: 0.85rem;
+  margin-bottom: 16px;
+}
+.auth-switch { text-align: center; margin-top: 16px; font-size: 0.85rem; color: var(--text-muted); }
+.auth-switch a { color: var(--primary); font-weight: 600; text-decoration: none; }
+
+/* ---------- Navbar user info ---------- */
+.nav-user { margin-left: 20px; color: var(--text-muted); font-size: 0.85rem; }
+.nav-links form { display: inline; margin-left: 10px; }
+
 /* ---------- Toast ---------- */
 .toast {
   position: fixed;

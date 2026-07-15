@@ -34,8 +34,6 @@ app = Flask(__name__)
 # environment variable - if it's hardcoded and someone reads the source code,
 # they can forge login sessions. The fallback here is only for local dev.
 app.secret_key = os.environ.get("SECRET_KEY", "dev-only-secret-change-me")
-
-
 # ---------------------------------------------------------------
 # Auth helpers
 # ---------------------------------------------------------------
@@ -90,6 +88,13 @@ def init_db():
     with open(SCHEMA_PATH) as f:
         conn.executescript(f.read())
     conn.close()
+
+
+# Run once at import time (not just under `python app.py`) - this is what
+# actually creates the tables when gunicorn imports this module in
+# production, since gunicorn never executes the `if __name__ == "__main__"`
+# block below.
+init_db()
 
 
 def mark_overdue_invoices(db, user_id):
@@ -676,5 +681,4 @@ def export_invoice_pdf(invoice_id):
 
 
 if __name__ == "__main__":
-    init_db()
     app.run(debug=True)
