@@ -1,0 +1,24 @@
+# Render Blueprint - lets you deploy via "New + Blueprint" using this file,
+# instead of clicking through every setting manually.
+#
+# NOTE on the disk: persistent disks require a paid instance type (Starter
+# or above). If you're on the Free plan, remove the `disk:` block below -
+# the app will still run, but billing.db will be wiped on every deploy and
+# whenever the free instance spins down from inactivity (~15 min idle).
+
+services:
+  - type: web
+    name: billing-invoice-system
+    runtime: python
+    plan: starter          # change to "free" if you don't need persistence
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DB_PATH
+        value: /data/billing.db
+    disk:
+      name: billing-data
+      mountPath: /data
+      sizeGB: 1
