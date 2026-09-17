@@ -1,98 +1,70 @@
 {% extends "base.html" %}
 {% block title %}{{ 'Edit' if invoice_id else 'New' }} Invoice - BillDesk{% endblock %}
-
 {% block content %}
   <h1>{{ 'Edit Invoice' if invoice_id else 'New Invoice' }}</h1>
-
   <form id="invoice-form" data-invoice-id="{{ invoice_id or '' }}">
     <div class="form-row">
-      <label>Customer *
-        <select id="customer-select" required></select>
-      </label>
+      <label>Customer *<select id="customer-select" required></select></label>
       <label>Status
         <select id="status-select">
+          <option value="Draft">Draft</option>
           <option value="Pending">Pending</option>
           <option value="Paid">Paid</option>
           <option value="Overdue">Overdue</option>
+          <option value="Cancelled">Cancelled</option>
         </select>
       </label>
     </div>
-
     <div class="form-row">
-      <label>Invoice Date *
-        <input type="date" id="invoice-date" required>
-      </label>
-      <label>Due Date *
-        <input type="date" id="due-date" required>
-      </label>
-      <label>Tax %
-        <input type="number" id="tax-percent" value="0" min="0" step="0.01">
-      </label>
+      <label>Invoice Date *<input type="date" id="invoice-date" required></label>
+      <label>Due Date *<input type="date" id="due-date" required></label>
+      <label>Tax %<input type="number" id="tax-percent" value="0" min="0" step="0.01"></label>
     </div>
-
     <h2>Line Items</h2>
     <table class="data-table" id="items-table">
-      <thead>
-        <tr>
-          <th>Item</th>
-          <th>Qty</th>
-          <th>Price</th>
-          <th>Line Total</th>
-          <th></th>
-        </tr>
-      </thead>
-      <tbody id="items-tbody">
-        <!-- rows injected by invoice_form.js -->
-      </tbody>
+      <thead><tr><th>Product (optional)</th><th>Item</th><th>Qty</th><th>Price</th><th>Line Total</th><th></th></tr></thead>
+      <tbody id="items-tbody"></tbody>
     </table>
     <button type="button" class="btn btn-secondary" id="btn-add-item">+ Add Line Item</button>
-
     <div class="totals-box">
       <div><span>Subtotal</span><span id="calc-subtotal">₹0.00</span></div>
       <div><span>Tax</span><span id="calc-tax">₹0.00</span></div>
       <div class="total-line"><span>Total</span><span id="calc-total">₹0.00</span></div>
     </div>
-
     <div class="modal-actions">
       <a href="/invoices" class="btn btn-secondary">Cancel</a>
       <button type="submit" class="btn btn-primary">Save Invoice</button>
     </div>
   </form>
-
   {% if invoice_id %}
     <div id="payments-section">
-      <div class="page-header">
-        <h2>Payments</h2>
-        <a href="/invoices/{{ invoice_id }}/pdf" class="btn btn-secondary" target="_blank">Download PDF</a>
-      </div>
-
+      <div class="page-header"><h2>Payments</h2><a href="/invoices/{{ invoice_id }}/pdf" class="btn btn-secondary" target="_blank">Download PDF</a></div>
       <div class="totals-box" id="payment-summary">
         <div><span>Amount Paid</span><span id="amount-paid">₹0.00</span></div>
         <div class="total-line"><span>Amount Due</span><span id="amount-due">₹0.00</span></div>
       </div>
-
       <table class="data-table">
-        <thead><tr><th>Date</th><th>Amount</th><th>Note</th><th></th></tr></thead>
+        <thead><tr><th>Date</th><th>Amount</th><th>Method</th><th>Reference</th><th>Note</th><th></th></tr></thead>
         <tbody id="payments-tbody"></tbody>
       </table>
       <p id="payments-empty" class="empty-state" style="display:none;">No payments recorded yet.</p>
-
       <form id="payment-form" class="form-row" style="align-items:flex-end; margin-top:12px;">
-        <label>Amount
-          <input type="number" id="payment-amount" min="0.01" step="0.01" required>
+        <label>Amount<input type="number" id="payment-amount" min="0.01" step="0.01" required></label>
+        <label>Date<input type="date" id="payment-date" required></label>
+        <label>Method
+          <select id="payment-method">
+            <option value="Cash">Cash</option>
+            <option value="Bank Transfer">Bank Transfer</option>
+            <option value="UPI">UPI</option>
+            <option value="Card">Card</option>
+            <option value="Other">Other</option>
+          </select>
         </label>
-        <label>Date
-          <input type="date" id="payment-date" required>
-        </label>
-        <label>Note
-          <input type="text" id="payment-note" placeholder="optional">
-        </label>
+        <label>Reference<input type="text" id="payment-reference" placeholder="txn id, optional"></label>
+        <label>Note<input type="text" id="payment-note" placeholder="optional"></label>
         <button type="submit" class="btn btn-primary">Record Payment</button>
       </form>
     </div>
   {% endif %}
 {% endblock %}
-
-{% block scripts %}
-  <script src="{{ url_for('static', filename='js/invoice_form.js') }}"></script>
-{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', filename='js/invoice_form.js') }}"></script>{% endblock %}

@@ -12,12 +12,8 @@
       <p class="subtitle">Create an account</p>
       {% if error %}<p class="auth-error">{{ error }}</p>{% endif %}
       <form method="POST" action="/register">
-        <label>Username
-          <input type="text" name="username" required autofocus>
-        </label>
-        <label>Password
-          <input type="password" name="password" required minlength="6">
-        </label>
+        <label>Username<input type="text" name="username" required autofocus></label>
+        <label>Password<input type="password" name="password" required minlength="6"></label>
         <button type="submit" class="btn btn-primary" style="width:100%; margin-top: 8px;">Create Account</button>
       </form>
       <p class="auth-switch">Already have an account? <a href="/login">Log in</a></p>

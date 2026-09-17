@@ -1,22 +1,19 @@
 """
-Billing & Invoice Management System
-------------------------------------
-Flask + SQLite backend. Serves HTML pages (server-rendered shells) and a
-small JSON REST API that the frontend JS calls with fetch().
-
-Every customer belongs to a logged-in user (users.id -> customers.user_id).
-Invoices and invoice_items don't store user_id directly - ownership is
-always checked by joining through customers, so there's exactly one place
-("does this customer belong to me?") that decides access.
+BillDesk - Billing & Invoice Management System
+-------------------------------------------------
+Phase 1 additions on top of the existing app: JWT authentication (alongside
+existing session auth) and Role-Based Access Control (Admin / Accountant /
+Sales Staff), enforced server-side.
 """
 
 import csv
 import io
 import os
 import sqlite3
-from datetime import date
+from datetime import date, datetime, timedelta
 from functools import wraps
 
+import jwt
 from flask import (
     Flask, g, jsonify, redirect, render_template, request, session,
     send_file, url_for,
@@ -24,41 +21,116 @@ from flask import (
 from werkzeug.security import check_password_hash, generate_password_hash
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# DB_PATH can be overridden via env var so a Railway volume (persistent disk)
-# can be mounted somewhere other than the app's own code directory.
 DB_PATH = os.environ.get("DB_PATH", os.path.join(BASE_DIR, "billing.db"))
 SCHEMA_PATH = os.path.join(BASE_DIR, "schema.sql")
 
 app = Flask(__name__)
-# SECRET_KEY signs the session cookie. In production this MUST come from an
-# environment variable - if it's hardcoded and someone reads the source code,
-# they can forge login sessions. The fallback here is only for local dev.
 app.secret_key = os.environ.get("SECRET_KEY", "dev-only-secret-change-me")
+
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRY_HOURS = 24
+
+
 # ---------------------------------------------------------------
-# Auth helpers
+# JWT helpers
+# ---------------------------------------------------------------
+def generate_jwt(user_id, username, role):
+    """Signed token carrying identity + role. Expires in 24h."""
+    payload = {
+        "user_id": user_id,
+        "username": username,
+        "role": role,
+        "exp": datetime.utcnow() + timedelta(hours=JWT_EXPIRY_HOURS),
+        "iat": datetime.utcnow(),
+    }
+    return jwt.encode(payload, app.secret_key, algorithm=JWT_ALGORITHM)
+
+
+def decode_jwt(token):
+    try:
+        return jwt.decode(token, app.secret_key, algorithms=[JWT_ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError:
+        return None
+
+
+# ---------------------------------------------------------------
+# Auth decorators
 # ---------------------------------------------------------------
 def login_required(view):
-    """Redirect to /login (or 401 for API calls) if nobody is logged in."""
+    """Accepts EITHER a session cookie (HTML pages) OR a JWT Bearer token
+    (API clients). Both resolve to g.user_id / g.username.
+
+    IMPORTANT: we deliberately do NOT trust the role stored in the session
+    or JWT payload. Roles can change after a token/session was issued (an
+    Admin can promote/demote someone), and a stale cached role would mean
+    that change doesn't take effect until the user logs out and back in.
+    Instead we look up the CURRENT role from the database on every request.
+    This costs one extra indexed lookup per request but means permission
+    changes apply immediately - which matters a lot for a billing system
+    where you might need to revoke someone's Accountant access right now,
+    not next time they happen to log in.
+    """
     @wraps(view)
     def wrapped(*args, **kwargs):
-        if "user_id" not in session:
+        user_id = None
+
+        if "user_id" in session:
+            user_id = session["user_id"]
+        else:
+            auth_header = request.headers.get("Authorization", "")
+            if auth_header.startswith("Bearer "):
+                payload = decode_jwt(auth_header[7:])
+                if payload:
+                    user_id = payload["user_id"]
+
+        if user_id is None:
             if request.path.startswith("/api/"):
                 return jsonify({"error": "Not authenticated"}), 401
             return redirect(url_for("login_page"))
+
+        db = get_db()
+        user = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        if user is None:
+            # Account was deleted after the token/session was issued
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "Not authenticated"}), 401
+            return redirect(url_for("login_page"))
+
+        g.user_id = user["id"]
+        g.username = user["username"]
+        g.role = user["role"]  # always fresh from the DB, never from the cached token
         return view(*args, **kwargs)
     return wrapped
 
 
+def role_required(*allowed_roles):
+    """Stack UNDER @login_required. Authorization check, separate from
+    authentication - enforced here on the backend, never trusted from the
+    frontend alone."""
+    def decorator(view):
+        @wraps(view)
+        def wrapped(*args, **kwargs):
+            if g.role not in allowed_roles:
+                return jsonify({
+                    "error": f"Requires role: {', '.join(allowed_roles)}. Your role: {g.role}"
+                }), 403
+            return view(*args, **kwargs)
+        return wrapped
+    return decorator
+
+
 def current_user_id():
-    return session["user_id"]
+    return g.user_id
 
 
 @app.context_processor
 def inject_user():
-    """Makes {{ username }} / {{ is_logged_in }} available in every template."""
     return {
         "is_logged_in": "user_id" in session,
         "username": session.get("username"),
+        "role": session.get("role"),
     }
 
 
@@ -66,11 +138,10 @@ def inject_user():
 # Database helpers
 # ---------------------------------------------------------------
 def get_db():
-    """Return a request-scoped SQLite connection (created once per request)."""
     if "db" not in g:
         g.db = sqlite3.connect(DB_PATH)
-        g.db.row_factory = sqlite3.Row  # lets us access columns by name, e.g. row["name"]
-        g.db.execute("PRAGMA foreign_keys = ON")  # SQLite disables FK checks by default!
+        g.db.row_factory = sqlite3.Row
+        g.db.execute("PRAGMA foreign_keys = ON")
     return g.db
 
 
@@ -82,7 +153,6 @@ def close_db(exception=None):
 
 
 def init_db():
-    """Run schema.sql once at startup. Safe to call every time (uses IF NOT EXISTS)."""
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     with open(SCHEMA_PATH) as f:
@@ -90,15 +160,10 @@ def init_db():
     conn.close()
 
 
-# Run once at import time (not just under `python app.py`) - this is what
-# actually creates the tables when gunicorn imports this module in
-# production, since gunicorn never executes the `if __name__ == "__main__"`
-# block below.
-init_db()
+init_db()  # runs at import time so gunicorn (production) also creates tables
 
 
 def mark_overdue_invoices(db, user_id):
-    """Any of this user's 'Pending' invoices past their due date become 'Overdue'."""
     today = date.today().isoformat()
     db.execute(
         """UPDATE invoices SET status = 'Overdue'
@@ -110,7 +175,6 @@ def mark_overdue_invoices(db, user_id):
 
 
 def recalculate_totals(items, tax_percent):
-    """Single source of truth for the subtotal/tax/total math used on create + update."""
     subtotal = sum(float(i["quantity"]) * float(i["price"]) for i in items)
     tax_amount = subtotal * float(tax_percent) / 100
     total = subtotal + tax_amount
@@ -118,12 +182,6 @@ def recalculate_totals(items, tax_percent):
 
 
 def get_owned_invoice(db, invoice_id, user_id):
-    """
-    Fetch an invoice row, but ONLY if it belongs (via its customer) to this
-    user. This is the ownership check used by every invoice-specific route -
-    without it, one logged-in user could read/edit/delete another user's
-    invoice just by guessing an id in the URL.
-    """
     return db.execute(
         """SELECT invoices.*, customers.name AS customer_name
            FROM invoices JOIN customers ON invoices.customer_id = customers.id
@@ -138,6 +196,41 @@ def get_amount_paid(db, invoice_id):
         (invoice_id,),
     ).fetchone()
     return round(row["paid"], 2)
+
+
+def adjust_stock(db, product_id, change_amount, reason):
+    """
+    The ONE function that changes stock. Never write to products.stock_quantity
+    directly anywhere else - always come through here, so every change is
+    guaranteed to also get logged in stock_movements. This is the same
+    "single source of truth" pattern we used for recalculate_totals().
+    """
+    db.execute(
+        "UPDATE products SET stock_quantity = stock_quantity + ? WHERE id = ?",
+        (change_amount, product_id),
+    )
+    db.execute(
+        "INSERT INTO stock_movements (product_id, change_amount, reason) VALUES (?, ?, ?)",
+        (product_id, change_amount, reason),
+    )
+
+
+def get_owned_product(db, product_id, user_id):
+    return db.execute(
+        "SELECT * FROM products WHERE id = ? AND user_id = ?", (product_id, user_id)
+    ).fetchone()
+
+
+def generate_invoice_number(db):
+    """INV-2026-001, INV-2026-002... resets numbering each calendar year."""
+    year = date.today().year
+    prefix = f"INV-{year}-"
+    last = db.execute(
+        "SELECT invoice_number FROM invoices WHERE invoice_number LIKE ? ORDER BY id DESC LIMIT 1",
+        (f"{prefix}%",),
+    ).fetchone()
+    next_seq = int(last["invoice_number"].split("-")[-1]) + 1 if last else 1
+    return f"{prefix}{next_seq:03d}"
 
 
 # ---------------------------------------------------------------
@@ -161,15 +254,23 @@ def register_page():
     if existing:
         return render_template("register.html", error="That username is already taken.")
 
+    # First user ever registered becomes Admin automatically (a common
+    # bootstrapping pattern - someone has to be Admin #1). Everyone after
+    # that defaults to Sales Staff; an Admin can be promoted later via the
+    # /api/v1/users/<id>/role endpoint below.
+    user_count = db.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+    role = "Admin" if user_count == 0 else "Sales Staff"
+
     password_hash = generate_password_hash(password)
     cur = db.execute(
-        "INSERT INTO users (username, password_hash) VALUES (?, ?)",
-        (username, password_hash),
+        "INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)",
+        (username, password_hash, role),
     )
     db.commit()
 
     session["user_id"] = cur.lastrowid
     session["username"] = username
+    session["role"] = role
     return redirect(url_for("dashboard_page"))
 
 
@@ -184,13 +285,12 @@ def login_page():
     db = get_db()
     user = db.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
 
-    # check_password_hash handles the hashing itself - we never compare
-    # plaintext passwords, and never store one either.
     if user is None or not check_password_hash(user["password_hash"], password):
         return render_template("login.html", error="Invalid username or password.")
 
     session["user_id"] = user["id"]
     session["username"] = user["username"]
+    session["role"] = user["role"]
     return redirect(url_for("dashboard_page"))
 
 
@@ -200,8 +300,49 @@ def logout():
     return redirect(url_for("login_page"))
 
 
+@app.route("/api/v1/auth/login", methods=["POST"])
+def api_login():
+    """JSON login for API clients (Postman, mobile app, etc). Returns a JWT
+    instead of setting a session cookie - this is what you'd call from a
+    non-browser client that can't store cookies."""
+    data = request.get_json(force=True)
+    username = (data.get("username") or "").strip()
+    password = data.get("password", "")
+
+    db = get_db()
+    user = db.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    if user is None or not check_password_hash(user["password_hash"], password):
+        return jsonify({"error": "Invalid username or password"}), 401
+
+    token = generate_jwt(user["id"], user["username"], user["role"])
+    return jsonify({
+        "token": token,
+        "expires_in_hours": JWT_EXPIRY_HOURS,
+        "user": {"id": user["id"], "username": user["username"], "role": user["role"]},
+    })
+
+
+@app.route("/api/v1/users/<int:target_user_id>/role", methods=["PATCH"])
+@login_required
+@role_required("Admin")
+def change_user_role(target_user_id):
+    """Admin-only: promote/demote another user's role. Demonstrates a real
+    admin-management action gated by RBAC."""
+    data = request.get_json(force=True)
+    new_role = data.get("role")
+    if new_role not in ("Admin", "Accountant", "Sales Staff"):
+        return jsonify({"error": "Invalid role"}), 400
+
+    db = get_db()
+    cur = db.execute("UPDATE users SET role = ? WHERE id = ?", (new_role, target_user_id))
+    db.commit()
+    if cur.rowcount == 0:
+        return jsonify({"error": "User not found"}), 404
+    return jsonify({"success": True})
+
+
 # ---------------------------------------------------------------
-# Page routes (render the HTML shell; JS fills in data via the API)
+# Page routes
 # ---------------------------------------------------------------
 @app.route("/")
 @login_required
@@ -235,6 +376,7 @@ def edit_invoice_page(invoice_id):
 
 # ---------------------------------------------------------------
 # API: customers
+# All authenticated roles can view. Only Admin can delete (RBAC example).
 # ---------------------------------------------------------------
 @app.route("/api/customers", methods=["GET"])
 @login_required
@@ -258,6 +400,35 @@ def get_customer(customer_id):
     if row is None:
         return jsonify({"error": "Customer not found"}), 404
     return jsonify(dict(row))
+
+
+@app.route("/api/customers/<int:customer_id>/stats", methods=["GET"])
+@login_required
+def get_customer_stats(customer_id):
+    """Phase 5: full billing history summary for one customer."""
+    db = get_db()
+    customer = db.execute(
+        "SELECT * FROM customers WHERE id = ? AND user_id = ?", (customer_id, current_user_id())
+    ).fetchone()
+    if customer is None:
+        return jsonify({"error": "Customer not found"}), 404
+
+    invoices = db.execute(
+        "SELECT * FROM invoices WHERE customer_id = ? ORDER BY invoice_date DESC", (customer_id,)
+    ).fetchall()
+
+    total_billed = sum(inv["total"] for inv in invoices)
+    total_paid = sum(get_amount_paid(db, inv["id"]) for inv in invoices)
+
+    return jsonify({
+        "customer": dict(customer),
+        "total_invoices": len(invoices),
+        "total_billed": round(total_billed, 2),
+        "total_paid": round(total_paid, 2),
+        "outstanding": round(total_billed - total_paid, 2),
+        "invoices": [dict(inv) for inv in invoices],
+    })
+
 
 
 @app.route("/api/customers", methods=["POST"])
@@ -300,6 +471,7 @@ def update_customer(customer_id):
 
 @app.route("/api/customers/<int:customer_id>", methods=["DELETE"])
 @login_required
+@role_required("Admin")   # <-- RBAC in action: only Admin can delete customers
 def delete_customer(customer_id):
     db = get_db()
     try:
@@ -309,12 +481,165 @@ def delete_customer(customer_id):
         )
         db.commit()
     except sqlite3.IntegrityError:
-        # Fires because invoices.customer_id has a FK pointing at this row
-        # and we deliberately did NOT set ON DELETE CASCADE.
         return jsonify({"error": "Cannot delete a customer that has invoices. Delete their invoices first."}), 400
     if cur.rowcount == 0:
         return jsonify({"error": "Customer not found"}), 404
     return jsonify({"success": True})
+
+
+# ---------------------------------------------------------------
+# API: products
+# All authenticated roles can VIEW products (Sales Staff needs to see
+# stock/prices to build an invoice). Only Admin can create/edit/delete -
+# same reasoning as customers: catalog and pricing are sensitive.
+# ---------------------------------------------------------------
+@app.route("/api/products", methods=["GET"])
+@login_required
+def get_products():
+    db = get_db()
+    rows = db.execute(
+        "SELECT * FROM products WHERE user_id = ? ORDER BY name COLLATE NOCASE",
+        (current_user_id(),),
+    ).fetchall()
+    products = []
+    for r in rows:
+        p = dict(r)
+        p["is_low_stock"] = p["stock_quantity"] <= p["low_stock_threshold"]
+        products.append(p)
+    return jsonify(products)
+
+
+@app.route("/api/products/<int:product_id>", methods=["GET"])
+@login_required
+def get_product(product_id):
+    db = get_db()
+    product = get_owned_product(db, product_id, current_user_id())
+    if product is None:
+        return jsonify({"error": "Product not found"}), 404
+    result = dict(product)
+    result["is_low_stock"] = result["stock_quantity"] <= result["low_stock_threshold"]
+    return jsonify(result)
+
+
+@app.route("/api/products", methods=["POST"])
+@login_required
+@role_required("Admin")
+def create_product():
+    data = request.get_json(force=True)
+    name = (data.get("name") or "").strip()
+    sku = (data.get("sku") or "").strip()
+    if not name or not sku:
+        return jsonify({"error": "Name and SKU are required"}), 400
+
+    db = get_db()
+    try:
+        cur = db.execute(
+            """INSERT INTO products
+               (user_id, sku, name, description, price, tax_percent,
+                stock_quantity, low_stock_threshold, is_active)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (current_user_id(), sku, name, data.get("description", ""),
+             float(data.get("price", 0)), float(data.get("tax_percent", 0)),
+             int(data.get("stock_quantity", 0)), int(data.get("low_stock_threshold", 5)),
+             1 if data.get("is_active", True) else 0),
+        )
+    except sqlite3.IntegrityError:
+        # Fires because of our UNIQUE(user_id, sku) constraint in schema.sql
+        return jsonify({"error": f"SKU '{sku}' already exists in your catalog"}), 400
+
+    product_id = cur.lastrowid
+    starting_stock = int(data.get("stock_quantity", 0))
+    if starting_stock > 0:
+        # Record the initial stock as a movement too, so the history is
+        # complete from day one, not just from the first sale.
+        db.execute(
+            "INSERT INTO stock_movements (product_id, change_amount, reason) VALUES (?, ?, ?)",
+            (product_id, starting_stock, "Initial stock"),
+        )
+    db.commit()
+    return jsonify({"id": product_id}), 201
+
+
+@app.route("/api/products/<int:product_id>", methods=["PUT"])
+@login_required
+@role_required("Admin")
+def update_product(product_id):
+    db = get_db()
+    if get_owned_product(db, product_id, current_user_id()) is None:
+        return jsonify({"error": "Product not found"}), 404
+
+    data = request.get_json(force=True)
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "Name is required"}), 400
+
+    # Note: stock_quantity is intentionally NOT editable here - it should
+    # only ever change through adjust_stock() (a sale or a deliberate
+    # adjustment), never by silently overwriting it in a generic update.
+    db.execute(
+        """UPDATE products SET name = ?, description = ?, price = ?, tax_percent = ?,
+           low_stock_threshold = ?, is_active = ? WHERE id = ?""",
+        (name, data.get("description", ""), float(data.get("price", 0)),
+         float(data.get("tax_percent", 0)), int(data.get("low_stock_threshold", 5)),
+         1 if data.get("is_active", True) else 0, product_id),
+    )
+    db.commit()
+    return jsonify({"success": True})
+
+
+@app.route("/api/products/<int:product_id>", methods=["DELETE"])
+@login_required
+@role_required("Admin")
+def delete_product(product_id):
+    db = get_db()
+    if get_owned_product(db, product_id, current_user_id()) is None:
+        return jsonify({"error": "Product not found"}), 404
+    # No try/except needed here: invoice_items.product_id uses ON DELETE
+    # SET NULL (see schema.sql), so this never fails - past invoices just
+    # lose their link to this product instead of blocking the delete.
+    db.execute("DELETE FROM products WHERE id = ?", (product_id,))
+    db.commit()
+    return jsonify({"success": True})
+
+
+@app.route("/api/products/<int:product_id>/adjust-stock", methods=["POST"])
+@login_required
+@role_required("Admin", "Accountant")
+def adjust_product_stock(product_id):
+    """Manual stock correction - e.g. restocking, damage write-off, a
+    physical inventory count correction. Always goes through adjust_stock()
+    so it's logged exactly like an automatic sale-driven change."""
+    db = get_db()
+    product = get_owned_product(db, product_id, current_user_id())
+    if product is None:
+        return jsonify({"error": "Product not found"}), 404
+
+    data = request.get_json(force=True)
+    try:
+        change = int(data.get("change_amount"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "change_amount must be a whole number (positive or negative)"}), 400
+    reason = (data.get("reason") or "Manual adjustment").strip()
+
+    if product["stock_quantity"] + change < 0:
+        return jsonify({"error": "This would make stock negative - not allowed"}), 400
+
+    adjust_stock(db, product_id, change, reason)
+    db.commit()
+    return jsonify({"success": True})
+
+
+@app.route("/api/products/<int:product_id>/stock-history", methods=["GET"])
+@login_required
+def get_stock_history(product_id):
+    db = get_db()
+    if get_owned_product(db, product_id, current_user_id()) is None:
+        return jsonify({"error": "Product not found"}), 404
+    rows = db.execute(
+        "SELECT * FROM stock_movements WHERE product_id = ? ORDER BY created_at DESC, id DESC",
+        (product_id,),
+    ).fetchall()
+    return jsonify([dict(r) for r in rows])
 
 
 # ---------------------------------------------------------------
@@ -340,16 +665,23 @@ def build_invoice_query(user_id, search, status):
 @app.route("/api/invoices", methods=["GET"])
 @login_required
 def get_invoices():
-    """Supports optional ?search=<customer name>&status=<Paid|Pending|Overdue>"""
     db = get_db()
     mark_overdue_invoices(db, current_user_id())
 
     search = request.args.get("search", "").strip()
     status = request.args.get("status", "").strip()
-    query, params = build_invoice_query(current_user_id(), search, status)
-    query += " ORDER BY invoices.invoice_date DESC, invoices.id DESC"
+    page = max(int(request.args.get("page", 1)), 1)
+    limit = min(max(int(request.args.get("limit", 20)), 1), 100)  # cap at 100 to prevent abuse
+    offset = (page - 1) * limit
 
-    rows = db.execute(query, params).fetchall()
+    query, params = build_invoice_query(current_user_id(), search, status)
+    count_row = db.execute(query.replace("SELECT invoices.*, customers.name AS customer_name", "SELECT COUNT(*) AS c"), params).fetchone()
+    total_count = count_row["c"]
+
+    query += " ORDER BY invoices.invoice_date DESC, invoices.id DESC LIMIT ? OFFSET ?"
+    params_with_page = params + [limit, offset]
+
+    rows = db.execute(query, params_with_page).fetchall()
     invoices = []
     for r in rows:
         inv = dict(r)
@@ -357,7 +689,14 @@ def get_invoices():
         inv["amount_paid"] = paid
         inv["amount_due"] = round(inv["total"] - paid, 2)
         invoices.append(inv)
-    return jsonify(invoices)
+
+    return jsonify({
+        "invoices": invoices,
+        "page": page,
+        "limit": limit,
+        "total_count": total_count,
+        "total_pages": (total_count + limit - 1) // limit if total_count else 1,
+    })
 
 
 @app.route("/api/invoices/<int:invoice_id>", methods=["GET"])
@@ -368,9 +707,7 @@ def get_invoice(invoice_id):
     if invoice is None:
         return jsonify({"error": "Invoice not found"}), 404
 
-    items = db.execute(
-        "SELECT * FROM invoice_items WHERE invoice_id = ?", (invoice_id,)
-    ).fetchall()
+    items = db.execute("SELECT * FROM invoice_items WHERE invoice_id = ?", (invoice_id,)).fetchall()
     payments = db.execute(
         "SELECT * FROM payments WHERE invoice_id = ? ORDER BY paid_on DESC, id DESC", (invoice_id,)
     ).fetchall()
@@ -396,33 +733,50 @@ def create_invoice():
         return jsonify({"error": "At least one line item is required"}), 400
 
     db = get_db()
-    # Make sure the chosen customer actually belongs to this user -
-    # otherwise a user could bill an invoice against someone else's customer.
     owned = db.execute(
         "SELECT id FROM customers WHERE id = ? AND user_id = ?", (customer_id, current_user_id())
     ).fetchone()
     if owned is None:
         return jsonify({"error": "Invalid customer"}), 400
 
+    # Validate stock BEFORE writing anything. If item #3 doesn't have
+    # enough stock, we want to fail the whole request - not create the
+    # invoice and then discover partway through that we can't fulfill it.
+    for item in items:
+        product_id = item.get("product_id")
+        if product_id:
+            product = get_owned_product(db, product_id, current_user_id())
+            if product is None:
+                return jsonify({"error": f"Invalid product_id {product_id}"}), 400
+            if product["stock_quantity"] < item["quantity"]:
+                return jsonify({
+                    "error": f"Not enough stock for '{product['name']}': "
+                             f"have {product['stock_quantity']}, need {item['quantity']}"
+                }), 400
+
     tax_percent = data.get("tax_percent", 0)
     subtotal, tax_amount, total = recalculate_totals(items, tax_percent)
+    invoice_number = generate_invoice_number(db)
 
     cur = db.execute(
         """INSERT INTO invoices
-           (customer_id, invoice_date, due_date, tax_percent, subtotal, tax_amount, total, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            customer_id, data.get("invoice_date"), data.get("due_date"),
-            tax_percent, subtotal, tax_amount, total, data.get("status", "Pending"),
-        ),
+           (invoice_number, customer_id, invoice_date, due_date, tax_percent, subtotal, tax_amount, total, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (invoice_number, customer_id, data.get("invoice_date"), data.get("due_date"),
+         tax_percent, subtotal, tax_amount, total, data.get("status", "Draft")),
     )
     invoice_id = cur.lastrowid
 
     for item in items:
+        product_id = item.get("product_id")
         db.execute(
-            "INSERT INTO invoice_items (invoice_id, item_name, quantity, price) VALUES (?, ?, ?, ?)",
-            (invoice_id, item["item_name"], item["quantity"], item["price"]),
+            "INSERT INTO invoice_items (invoice_id, product_id, item_name, quantity, price) VALUES (?, ?, ?, ?, ?)",
+            (invoice_id, product_id, item["item_name"], item["quantity"], item["price"]),
         )
+        if product_id:
+            # Stock goes DOWN (negative change) because this invoice sold it.
+            adjust_stock(db, product_id, -item["quantity"], f"Invoice #{invoice_id} created")
+
     db.commit()
     return jsonify({"id": invoice_id}), 201
 
@@ -447,18 +801,32 @@ def update_invoice(invoice_id):
            SET customer_id = ?, invoice_date = ?, due_date = ?, tax_percent = ?,
                subtotal = ?, tax_amount = ?, total = ?, status = ?
            WHERE id = ?""",
-        (
-            data.get("customer_id"), data.get("invoice_date"), data.get("due_date"),
-            tax_percent, subtotal, tax_amount, total, data.get("status", "Pending"), invoice_id,
-        ),
+        (data.get("customer_id"), data.get("invoice_date"), data.get("due_date"),
+         tax_percent, subtotal, tax_amount, total, data.get("status", "Pending"), invoice_id),
     )
-    # Simplest correct way to sync line items: wipe and re-insert.
+
+    # Undo stock effects of the OLD line items before applying the new ones.
+    # Editing an invoice from "3 units" down to "1 unit" should give 2 units
+    # back to stock - and if it's re-linked to a different product entirely,
+    # the old product's stock needs restoring while the new one gets deducted.
+    old_items = db.execute(
+        "SELECT product_id, quantity FROM invoice_items WHERE invoice_id = ?", (invoice_id,)
+    ).fetchall()
+    for old_item in old_items:
+        if old_item["product_id"]:
+            adjust_stock(db, old_item["product_id"], old_item["quantity"], f"Invoice #{invoice_id} edited (reverting old item)")
+
     db.execute("DELETE FROM invoice_items WHERE invoice_id = ?", (invoice_id,))
+
     for item in items:
+        product_id = item.get("product_id")
         db.execute(
-            "INSERT INTO invoice_items (invoice_id, item_name, quantity, price) VALUES (?, ?, ?, ?)",
-            (invoice_id, item["item_name"], item["quantity"], item["price"]),
+            "INSERT INTO invoice_items (invoice_id, product_id, item_name, quantity, price) VALUES (?, ?, ?, ?, ?)",
+            (invoice_id, product_id, item["item_name"], item["quantity"], item["price"]),
         )
+        if product_id:
+            adjust_stock(db, product_id, -item["quantity"], f"Invoice #{invoice_id} edited (applying new item)")
+
     db.commit()
     return jsonify({"success": True})
 
@@ -472,7 +840,7 @@ def update_invoice_status(invoice_id):
 
     data = request.get_json(force=True)
     status = data.get("status")
-    if status not in ("Paid", "Pending", "Overdue"):
+    if status not in ("Draft", "Pending", "Paid", "Overdue", "Cancelled"):
         return jsonify({"error": "Invalid status"}), 400
     db.execute("UPDATE invoices SET status = ? WHERE id = ?", (status, invoice_id))
     db.commit()
@@ -481,20 +849,33 @@ def update_invoice_status(invoice_id):
 
 @app.route("/api/invoices/<int:invoice_id>", methods=["DELETE"])
 @login_required
+@role_required("Admin")   # only Admin can delete invoices
 def delete_invoice(invoice_id):
     db = get_db()
     if get_owned_invoice(db, invoice_id, current_user_id()) is None:
         return jsonify({"error": "Invoice not found"}), 404
-    db.execute("DELETE FROM invoices WHERE id = ?", (invoice_id,))  # cascades to items + payments
+
+    # Give stock back before deleting - a cancelled/deleted invoice's items
+    # were never actually delivered, so those units should return to the shelf.
+    items = db.execute(
+        "SELECT product_id, quantity FROM invoice_items WHERE invoice_id = ?", (invoice_id,)
+    ).fetchall()
+    for item in items:
+        if item["product_id"]:
+            adjust_stock(db, item["product_id"], item["quantity"], f"Invoice #{invoice_id} deleted")
+
+    db.execute("DELETE FROM invoices WHERE id = ?", (invoice_id,))
     db.commit()
     return jsonify({"success": True})
 
 
 # ---------------------------------------------------------------
-# API: payments (partial payments against an invoice)
+# API: payments - Admin or Accountant only (Sales Staff can view invoices
+# but shouldn't be recording money received - a realistic RBAC boundary)
 # ---------------------------------------------------------------
 @app.route("/api/invoices/<int:invoice_id>/payments", methods=["POST"])
 @login_required
+@role_required("Admin", "Accountant")
 def add_payment(invoice_id):
     db = get_db()
     invoice = get_owned_invoice(db, invoice_id, current_user_id())
@@ -510,30 +891,29 @@ def add_payment(invoice_id):
         return jsonify({"error": "Payment amount must be greater than zero"}), 400
 
     paid_on = data.get("paid_on") or date.today().isoformat()
+    payment_method = (data.get("payment_method") or "Cash").strip()
+    reference_id = (data.get("reference_id") or "").strip()
     note = (data.get("note") or "").strip()
 
     db.execute(
-        "INSERT INTO payments (invoice_id, amount, paid_on, note) VALUES (?, ?, ?, ?)",
-        (invoice_id, amount, paid_on, note),
+        "INSERT INTO payments (invoice_id, amount, paid_on, payment_method, reference_id, note) VALUES (?, ?, ?, ?, ?, ?)",
+        (invoice_id, amount, paid_on, payment_method, reference_id, note),
     )
 
-    # If this payment (plus any earlier ones) covers the full total,
-    # auto-flip the invoice to Paid. Partial payments don't change status -
-    # the UI shows "amount_due" so the user can see it's partially settled
-    # without needing a 4th status value that would break the CHECK constraint.
     total_paid = get_amount_paid(db, invoice_id)
     if total_paid >= invoice["total"]:
         db.execute("UPDATE invoices SET status = 'Paid' WHERE id = ?", (invoice_id,))
 
     db.commit()
-    return jsonify({"success": True, "amount_paid": total_paid, "amount_due": round(invoice["total"] - total_paid, 2)}), 201
+    return jsonify({"success": True, "amount_paid": total_paid,
+                     "amount_due": round(invoice["total"] - total_paid, 2)}), 201
 
 
 @app.route("/api/payments/<int:payment_id>", methods=["DELETE"])
 @login_required
+@role_required("Admin", "Accountant")
 def delete_payment(payment_id):
     db = get_db()
-    # Ownership check: walk payment -> invoice -> customer -> user
     row = db.execute(
         """SELECT payments.id, payments.invoice_id FROM payments
            JOIN invoices ON payments.invoice_id = invoices.id
@@ -545,7 +925,6 @@ def delete_payment(payment_id):
         return jsonify({"error": "Payment not found"}), 404
 
     db.execute("DELETE FROM payments WHERE id = ?", (payment_id,))
-    # Removing a payment can un-pay an invoice that was auto-marked Paid.
     invoice = db.execute("SELECT * FROM invoices WHERE id = ?", (row["invoice_id"],)).fetchone()
     total_paid = get_amount_paid(db, row["invoice_id"])
     if invoice["status"] == "Paid" and total_paid < invoice["total"]:
@@ -571,30 +950,23 @@ def dashboard_data():
 
     base = "FROM invoices JOIN customers ON invoices.customer_id = customers.id WHERE customers.user_id = ?"
 
-    total_revenue = scalar(f"SELECT COALESCE(SUM(total), 0) {base} AND invoices.status = 'Paid'", (user_id,))
-    total_pending = scalar(f"SELECT COALESCE(SUM(total), 0) {base} AND invoices.status = 'Pending'", (user_id,))
-    overdue_amount = scalar(f"SELECT COALESCE(SUM(total), 0) {base} AND invoices.status = 'Overdue'", (user_id,))
-    overdue_count = scalar(f"SELECT COUNT(*) {base} AND invoices.status = 'Overdue'", (user_id,))
-    total_invoices = scalar(f"SELECT COUNT(*) {base}", (user_id,))
-
     return jsonify({
-        "total_revenue": total_revenue,
-        "total_pending": total_pending,
-        "overdue_amount": overdue_amount,
-        "overdue_count": overdue_count,
-        "total_invoices": total_invoices,
+        "total_revenue": scalar(f"SELECT COALESCE(SUM(total), 0) {base} AND invoices.status = 'Paid'", (user_id,)),
+        "total_pending": scalar(f"SELECT COALESCE(SUM(total), 0) {base} AND invoices.status = 'Pending'", (user_id,)),
+        "overdue_amount": scalar(f"SELECT COALESCE(SUM(total), 0) {base} AND invoices.status = 'Overdue'", (user_id,)),
+        "overdue_count": scalar(f"SELECT COUNT(*) {base} AND invoices.status = 'Overdue'", (user_id,)),
+        "total_invoices": scalar(f"SELECT COUNT(*) {base}", (user_id,)),
     })
 
 
 # ---------------------------------------------------------------
-# CSV export
+# CSV / PDF export (unchanged from before)
 # ---------------------------------------------------------------
 @app.route("/api/invoices/export", methods=["GET"])
 @login_required
 def export_invoices_csv():
     db = get_db()
     mark_overdue_invoices(db, current_user_id())
-
     search = request.args.get("search", "").strip()
     status = request.args.get("status", "").strip()
     query, params = build_invoice_query(current_user_id(), search, status)
@@ -607,22 +979,14 @@ def export_invoices_csv():
                       "Subtotal", "Tax %", "Tax Amount", "Total", "Amount Paid", "Amount Due", "Status"])
     for r in rows:
         paid = get_amount_paid(db, r["id"])
-        writer.writerow([
-            r["id"], r["customer_name"], r["invoice_date"], r["due_date"],
-            r["subtotal"], r["tax_percent"], r["tax_amount"], r["total"],
-            paid, round(r["total"] - paid, 2), r["status"],
-        ])
+        writer.writerow([r["id"], r["customer_name"], r["invoice_date"], r["due_date"],
+                          r["subtotal"], r["tax_percent"], r["tax_amount"], r["total"],
+                          paid, round(r["total"] - paid, 2), r["status"]])
 
     mem = io.BytesIO(output.getvalue().encode("utf-8"))
-    return send_file(
-        mem, mimetype="text/csv", as_attachment=True,
-        download_name="invoices_export.csv",
-    )
+    return send_file(mem, mimetype="text/csv", as_attachment=True, download_name="invoices_export.csv")
 
 
-# ---------------------------------------------------------------
-# PDF export (single invoice)
-# ---------------------------------------------------------------
 @app.route("/invoices/<int:invoice_id>/pdf", methods=["GET"])
 @login_required
 def export_invoice_pdf(invoice_id):
@@ -651,7 +1015,6 @@ def export_invoice_pdf(invoice_id):
         Paragraph(f"Status: {invoice['status']}", styles["Normal"]),
         Spacer(1, 12),
     ]
-
     table_data = [["Item", "Qty", "Price", "Line Total"]]
     for item in items:
         line_total = item["quantity"] * item["price"]
@@ -673,11 +1036,7 @@ def export_invoice_pdf(invoice_id):
     story.append(table)
     doc.build(story)
     buffer.seek(0)
-
-    return send_file(
-        buffer, mimetype="application/pdf", as_attachment=True,
-        download_name=f"invoice_{invoice_id}.pdf",
-    )
+    return send_file(buffer, mimetype="application/pdf", as_attachment=True, download_name=f"invoice_{invoice_id}.pdf")
 
 
 if __name__ == "__main__":

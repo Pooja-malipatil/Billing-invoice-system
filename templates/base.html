@@ -14,20 +14,17 @@
       <a href="/customers" class="{{ 'active' if request.path == '/customers' else '' }}">Customers</a>
       <a href="/invoices" class="{{ 'active' if request.path.startswith('/invoices') else '' }}">Invoices</a>
       {% if is_logged_in %}
-        <span class="nav-user">👤 {{ username }}</span>
+        <span class="nav-user">👤 {{ username }} ({{ role }})</span>
         <form method="POST" action="/logout" style="display:inline;">
           <button type="submit" class="btn btn-secondary btn-small">Log out</button>
         </form>
       {% endif %}
     </div>
   </nav>
-
   <main class="container">
     {% block content %}{% endblock %}
   </main>
-
   <div id="toast" class="toast"></div>
-
   <script src="{{ url_for('static', filename='js/common.js') }}"></script>
   {% block scripts %}{% endblock %}
 </body>

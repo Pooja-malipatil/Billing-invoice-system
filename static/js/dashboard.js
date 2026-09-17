@@ -6,9 +6,6 @@ async function loadDashboard() {
     document.getElementById("stat-overdue-count").textContent = stats.overdue_count;
     document.getElementById("stat-overdue-amount").textContent = formatCurrency(stats.overdue_amount);
     document.getElementById("stat-total-invoices").textContent = stats.total_invoices;
-  } catch (err) {
-    showToast(err.message, true);
-  }
+  } catch (err) { showToast(err.message, true); }
 }
-
 loadDashboard();

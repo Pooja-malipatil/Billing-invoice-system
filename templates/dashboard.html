@@ -1,39 +1,18 @@
 {% extends "base.html" %}
 {% block title %}Dashboard - BillDesk{% endblock %}
-
 {% block content %}
   <h1>Dashboard</h1>
   <p class="subtitle">A quick snapshot of your billing health.</p>
-
   <div class="cards" id="dashboard-cards">
-    <div class="card revenue">
-      <span class="card-label">Total Revenue (Paid)</span>
-      <span class="card-value" id="stat-revenue">—</span>
-    </div>
-    <div class="card pending">
-      <span class="card-label">Total Pending</span>
-      <span class="card-value" id="stat-pending">—</span>
-    </div>
-    <div class="card overdue">
-      <span class="card-label">Overdue Invoices</span>
-      <span class="card-value" id="stat-overdue-count">—</span>
-    </div>
-    <div class="card overdue-amount">
-      <span class="card-label">Overdue Amount</span>
-      <span class="card-value" id="stat-overdue-amount">—</span>
-    </div>
-    <div class="card total">
-      <span class="card-label">Total Invoices</span>
-      <span class="card-value" id="stat-total-invoices">—</span>
-    </div>
+    <div class="card revenue"><span class="card-label">Total Revenue (Paid)</span><span class="card-value" id="stat-revenue">—</span></div>
+    <div class="card pending"><span class="card-label">Total Pending</span><span class="card-value" id="stat-pending">—</span></div>
+    <div class="card overdue"><span class="card-label">Overdue Invoices</span><span class="card-value" id="stat-overdue-count">—</span></div>
+    <div class="card overdue-amount"><span class="card-label">Overdue Amount</span><span class="card-value" id="stat-overdue-amount">—</span></div>
+    <div class="card total"><span class="card-label">Total Invoices</span><span class="card-value" id="stat-total-invoices">—</span></div>
   </div>
-
   <div class="quick-links">
     <a href="/invoices/new" class="btn btn-primary">+ New Invoice</a>
     <a href="/customers" class="btn btn-secondary">Manage Customers</a>
   </div>
 {% endblock %}
-
-{% block scripts %}
-  <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
-{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>{% endblock %}

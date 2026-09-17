@@ -1,45 +1,25 @@
 {% extends "base.html" %}
 {% block title %}Invoices - BillDesk{% endblock %}
-
 {% block content %}
   <div class="page-header">
     <h1>Invoices</h1>
-    <div>
-      <button class="btn btn-secondary" id="btn-export-csv">Export CSV</button>
-      <a href="/invoices/new" class="btn btn-primary">+ New Invoice</a>
-    </div>
+    <div><button class="btn btn-secondary" id="btn-export-csv">Export CSV</button> <a href="/invoices/new" class="btn btn-primary">+ New Invoice</a></div>
   </div>
-
   <div class="filters">
     <input type="text" id="filter-search" placeholder="Search by customer name...">
     <select id="filter-status">
       <option value="">All statuses</option>
-      <option value="Paid">Paid</option>
+      <option value="Draft">Draft</option>
       <option value="Pending">Pending</option>
+      <option value="Paid">Paid</option>
       <option value="Overdue">Overdue</option>
+      <option value="Cancelled">Cancelled</option>
     </select>
   </div>
-
   <table class="data-table">
-    <thead>
-      <tr>
-        <th>#</th>
-        <th>Customer</th>
-        <th>Invoice Date</th>
-        <th>Due Date</th>
-        <th>Total</th>
-        <th>Amount Due</th>
-        <th>Status</th>
-        <th></th>
-      </tr>
-    </thead>
-    <tbody id="invoices-tbody">
-      <!-- rows injected by invoices.js -->
-    </tbody>
+    <thead><tr><th>#</th><th>Customer</th><th>Invoice Date</th><th>Due Date</th><th>Total</th><th>Amount Due</th><th>Status</th><th></th></tr></thead>
+    <tbody id="invoices-tbody"></tbody>
   </table>
   <p id="invoices-empty" class="empty-state" style="display:none;">No invoices match your filters.</p>
 {% endblock %}
-
-{% block scripts %}
-  <script src="{{ url_for('static', filename='js/invoices.js') }}"></script>
-{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', filename='js/invoices.js') }}"></script>{% endblock %}

@@ -1,124 +1,114 @@
 PRAGMA foreign_keys = ON;
 
--- ==========================================================
--- USERS
--- ==========================================================
+-- 0) USERS ---------------------------------------------------
+-- Every customer (and therefore every invoice, via the customer) belongs to
+-- exactly one user, so users only ever see their own billing data.
+-- `role` drives Role-Based Access Control (RBAC) - checked server-side on
+-- every sensitive action, not just hidden in the UI.
 CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    password_hash TEXT NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    username       TEXT NOT NULL UNIQUE,
+    password_hash  TEXT NOT NULL,
+    role           TEXT NOT NULL DEFAULT 'Sales Staff'
+                   CHECK (role IN ('Admin', 'Accountant', 'Sales Staff')),
+    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- ==========================================================
--- CUSTOMERS
--- ==========================================================
+-- 1) CUSTOMERS -------------------------------------------------
 CREATE TABLE IF NOT EXISTS customers (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    name TEXT NOT NULL,
-    email TEXT UNIQUE,
-    phone TEXT,
-    address TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-
-    FOREIGN KEY (user_id)
-        REFERENCES users(id)
-        ON DELETE CASCADE
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL,
+    name        TEXT NOT NULL,
+    email       TEXT,
+    phone       TEXT,
+    address     TEXT,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
--- ==========================================================
--- INVOICES
--- ==========================================================
+-- 2) INVOICES ----------------------------------------------------
 CREATE TABLE IF NOT EXISTS invoices (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    customer_id INTEGER NOT NULL,
-
-    invoice_date TEXT NOT NULL
-        CHECK(invoice_date GLOB '????-??-??'),
-
-    due_date TEXT NOT NULL
-        CHECK(due_date GLOB '????-??-??')
-        CHECK(due_date >= invoice_date),
-
-    tax_percent REAL NOT NULL DEFAULT 0
-        CHECK(tax_percent >= 0 AND tax_percent <= 100),
-
-    subtotal REAL NOT NULL DEFAULT 0
-        CHECK(subtotal >= 0),
-
-    tax_amount REAL NOT NULL DEFAULT 0
-        CHECK(tax_amount >= 0),
-
-    total REAL NOT NULL DEFAULT 0
-        CHECK(total >= 0),
-
-    status TEXT NOT NULL DEFAULT 'Pending'
-        CHECK(status IN ('Paid', 'Pending', 'Overdue')),
-
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-
-    FOREIGN KEY (customer_id)
-        REFERENCES customers(id)
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    invoice_number TEXT UNIQUE,        -- e.g. INV-2026-001, generated on create
+    customer_id   INTEGER NOT NULL,
+    invoice_date  TEXT NOT NULL,
+    due_date      TEXT NOT NULL,
+    tax_percent   REAL NOT NULL DEFAULT 0,
+    subtotal      REAL NOT NULL DEFAULT 0,
+    tax_amount    REAL NOT NULL DEFAULT 0,
+    total         REAL NOT NULL DEFAULT 0,
+    status        TEXT NOT NULL DEFAULT 'Draft'
+                  CHECK (status IN ('Draft', 'Pending', 'Paid', 'Overdue', 'Cancelled')),
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (customer_id) REFERENCES customers(id)
 );
 
--- ==========================================================
--- INVOICE ITEMS
--- ==========================================================
+-- 3) INVOICE_ITEMS ----------------------------------------------
 CREATE TABLE IF NOT EXISTS invoice_items (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    invoice_id INTEGER NOT NULL,
-
-    item_name TEXT NOT NULL,
-
-    quantity REAL NOT NULL
-        CHECK(quantity > 0),
-
-    price REAL NOT NULL
-        CHECK(price >= 0),
-
-    FOREIGN KEY (invoice_id)
-        REFERENCES invoices(id)
-        ON DELETE CASCADE
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    invoice_id   INTEGER NOT NULL,
+    product_id   INTEGER,             -- nullable: NULL means a freeform line item not tied to inventory
+    item_name    TEXT NOT NULL,
+    quantity     REAL NOT NULL,
+    price        REAL NOT NULL,
+    FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE CASCADE,
+    FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE SET NULL
+    -- ON DELETE SET NULL: if a product is deleted later, past invoices keep
+    -- their line item text/price - they just lose the link to the (now
+    -- gone) product. Historical invoices must never break.
 );
 
--- ==========================================================
--- PAYMENTS
--- ==========================================================
+-- 4) PAYMENTS -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payments (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-    invoice_id INTEGER NOT NULL,
-
-    amount REAL NOT NULL
-        CHECK(amount > 0),
-
-    paid_on TEXT NOT NULL
-        CHECK(paid_on GLOB '????-??-??'),
-
-    note TEXT,
-
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-
-    FOREIGN KEY (invoice_id)
-        REFERENCES invoices(id)
-        ON DELETE CASCADE
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    invoice_id     INTEGER NOT NULL,
+    amount         REAL NOT NULL,
+    paid_on        TEXT NOT NULL,
+    payment_method TEXT DEFAULT 'Cash',
+    reference_id   TEXT,
+    note           TEXT,
+    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE CASCADE
 );
 
--- ==========================================================
--- INDEXES
--- ==========================================================
-CREATE INDEX IF NOT EXISTS idx_customers_user
-ON customers(user_id);
+-- 5) PRODUCTS -----------------------------------------------------
+-- Each user has their own product catalog (same ownership pattern as
+-- customers - scoped by user_id, checked on every query).
+CREATE TABLE IF NOT EXISTS products (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id             INTEGER NOT NULL,
+    sku                 TEXT NOT NULL,
+    name                TEXT NOT NULL,
+    description         TEXT,
+    price               REAL NOT NULL DEFAULT 0,
+    tax_percent         REAL NOT NULL DEFAULT 0,
+    stock_quantity      INTEGER NOT NULL DEFAULT 0,
+    low_stock_threshold INTEGER NOT NULL DEFAULT 5,
+    is_active           INTEGER NOT NULL DEFAULT 1,  -- SQLite has no boolean type; 1=true, 0=false
+    created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    UNIQUE (user_id, sku)  -- SKU must be unique within one user's catalog, not globally
+);
 
-CREATE INDEX IF NOT EXISTS idx_invoices_customer
-ON invoices(customer_id);
+-- 6) STOCK_MOVEMENTS -------------------------------------------------
+-- An append-only log: we NEVER just overwrite stock_quantity silently.
+-- Every change - whether from a sale or a manual correction - gets a row
+-- here explaining what happened. This is what "inventory history" means
+-- in a real system: you can always answer "why is stock at this number?"
+CREATE TABLE IF NOT EXISTS stock_movements (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id     INTEGER NOT NULL,
+    change_amount  INTEGER NOT NULL,   -- negative = stock went down, positive = went up
+    reason         TEXT NOT NULL,      -- e.g. 'Invoice #12', 'Manual restock', 'Correction'
+    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
+);
 
-CREATE INDEX IF NOT EXISTS idx_invoices_status
-ON invoices(status);
-
-CREATE INDEX IF NOT EXISTS idx_items_invoice
-ON invoice_items(invoice_id);
-
-CREATE INDEX IF NOT EXISTS idx_payments_invoice
-ON payments(invoice_id);
+-- Indexes to keep filtered/joined queries fast as data grows
+CREATE INDEX IF NOT EXISTS idx_customers_user ON customers(user_id);
+CREATE INDEX IF NOT EXISTS idx_invoices_customer ON invoices(customer_id);
+CREATE INDEX IF NOT EXISTS idx_invoices_status   ON invoices(status);
+CREATE INDEX IF NOT EXISTS idx_items_invoice      ON invoice_items(invoice_id);
+CREATE INDEX IF NOT EXISTS idx_payments_invoice   ON payments(invoice_id);
+CREATE INDEX IF NOT EXISTS idx_products_user       ON products(user_id);
+CREATE INDEX IF NOT EXISTS idx_stock_moves_product  ON stock_movements(product_id);
