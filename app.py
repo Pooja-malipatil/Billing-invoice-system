@@ -165,12 +165,25 @@ init_db()  # runs at import time so gunicorn (production) also creates tables
 
 def mark_overdue_invoices(db, user_id):
     today = date.today().isoformat()
+    # Find which invoices are ABOUT to flip, before updating, so we know
+    # exactly which ones to notify about (not every already-overdue one).
+    newly_overdue = db.execute(
+        """SELECT invoices.id, invoices.invoice_number, customers.name AS customer_name
+           FROM invoices JOIN customers ON invoices.customer_id = customers.id
+           WHERE invoices.status = 'Pending' AND invoices.due_date < ?
+             AND customers.user_id = ?""",
+        (today, user_id),
+    ).fetchall()
+
     db.execute(
         """UPDATE invoices SET status = 'Overdue'
            WHERE status = 'Pending' AND due_date < ?
              AND customer_id IN (SELECT id FROM customers WHERE user_id = ?)""",
         (today, user_id),
     )
+    for inv in newly_overdue:
+        label = inv["invoice_number"] or f"#{inv['id']}"
+        notify(db, user_id, "overdue", f"Invoice {label} for {inv['customer_name']} is now overdue")
     db.commit()
 
 
@@ -214,6 +227,16 @@ def adjust_stock(db, product_id, change_amount, reason):
         (product_id, change_amount, reason),
     )
 
+    # Low-stock notification: only fire when stock DROPS (change_amount < 0)
+    # and crosses at/below the threshold - not on every read, and not when
+    # stock is going UP (a restock shouldn't trigger a "running low" alert).
+    if change_amount < 0:
+        product = db.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
+        if product and product["stock_quantity"] <= product["low_stock_threshold"]:
+            notify(db, product["user_id"], "low_stock",
+                   f"'{product['name']}' is low on stock: {product['stock_quantity']} left "
+                   f"(threshold {product['low_stock_threshold']})")
+
 
 def get_owned_product(db, product_id, user_id):
     return db.execute(
@@ -231,6 +254,23 @@ def generate_invoice_number(db):
     ).fetchone()
     next_seq = int(last["invoice_number"].split("-")[-1]) + 1 if last else 1
     return f"{prefix}{next_seq:03d}"
+
+
+def log_audit(db, action, entity, entity_id, details=""):
+    """Single place every sensitive action gets recorded. Called AFTER the
+    real change, in the same transaction/commit, so the log entry and the
+    actual change succeed or fail together - never one without the other."""
+    db.execute(
+        "INSERT INTO audit_log (user_id, username, action, entity, entity_id, details) VALUES (?, ?, ?, ?, ?, ?)",
+        (g.user_id, g.username, action, entity, entity_id, details),
+    )
+
+
+def notify(db, user_id, notif_type, message):
+    db.execute(
+        "INSERT INTO notifications (user_id, type, message) VALUES (?, ?, ?)",
+        (user_id, notif_type, message),
+    )
 
 
 # ---------------------------------------------------------------
@@ -335,9 +375,11 @@ def change_user_role(target_user_id):
 
     db = get_db()
     cur = db.execute("UPDATE users SET role = ? WHERE id = ?", (new_role, target_user_id))
-    db.commit()
     if cur.rowcount == 0:
+        db.rollback()
         return jsonify({"error": "User not found"}), 404
+    log_audit(db, "CHANGE_USER_ROLE", "user", target_user_id, f"Changed role to {new_role}")
+    db.commit()
     return jsonify({"success": True})
 
 
@@ -474,16 +516,20 @@ def update_customer(customer_id):
 @role_required("Admin")   # <-- RBAC in action: only Admin can delete customers
 def delete_customer(customer_id):
     db = get_db()
+    customer = db.execute("SELECT name FROM customers WHERE id = ?", (customer_id,)).fetchone()
     try:
         cur = db.execute(
             "DELETE FROM customers WHERE id = ? AND user_id = ?",
             (customer_id, current_user_id()),
         )
-        db.commit()
     except sqlite3.IntegrityError:
+        db.rollback()
         return jsonify({"error": "Cannot delete a customer that has invoices. Delete their invoices first."}), 400
     if cur.rowcount == 0:
+        db.rollback()
         return jsonify({"error": "Customer not found"}), 404
+    log_audit(db, "DELETE_CUSTOMER", "customer", customer_id, f"Deleted customer '{customer['name'] if customer else customer_id}'")
+    db.commit()
     return jsonify({"success": True})
 
 
@@ -777,6 +823,7 @@ def create_invoice():
             # Stock goes DOWN (negative change) because this invoice sold it.
             adjust_stock(db, product_id, -item["quantity"], f"Invoice #{invoice_id} created")
 
+    notify(db, current_user_id(), "invoice_created", f"Invoice {invoice_number} created for ₹{total:.2f}")
     db.commit()
     return jsonify({"id": invoice_id}), 201
 
@@ -852,11 +899,10 @@ def update_invoice_status(invoice_id):
 @role_required("Admin")   # only Admin can delete invoices
 def delete_invoice(invoice_id):
     db = get_db()
-    if get_owned_invoice(db, invoice_id, current_user_id()) is None:
+    invoice = get_owned_invoice(db, invoice_id, current_user_id())
+    if invoice is None:
         return jsonify({"error": "Invoice not found"}), 404
 
-    # Give stock back before deleting - a cancelled/deleted invoice's items
-    # were never actually delivered, so those units should return to the shelf.
     items = db.execute(
         "SELECT product_id, quantity FROM invoice_items WHERE invoice_id = ?", (invoice_id,)
     ).fetchall()
@@ -865,6 +911,8 @@ def delete_invoice(invoice_id):
             adjust_stock(db, item["product_id"], item["quantity"], f"Invoice #{invoice_id} deleted")
 
     db.execute("DELETE FROM invoices WHERE id = ?", (invoice_id,))
+    log_audit(db, "DELETE_INVOICE", "invoice", invoice_id,
+              f"Deleted invoice {invoice['invoice_number'] or invoice_id} (₹{invoice['total']:.2f})")
     db.commit()
     return jsonify({"success": True})
 
@@ -895,14 +943,20 @@ def add_payment(invoice_id):
     reference_id = (data.get("reference_id") or "").strip()
     note = (data.get("note") or "").strip()
 
-    db.execute(
+    cur = db.execute(
         "INSERT INTO payments (invoice_id, amount, paid_on, payment_method, reference_id, note) VALUES (?, ?, ?, ?, ?, ?)",
         (invoice_id, amount, paid_on, payment_method, reference_id, note),
     )
+    payment_id = cur.lastrowid
 
     total_paid = get_amount_paid(db, invoice_id)
     if total_paid >= invoice["total"]:
         db.execute("UPDATE invoices SET status = 'Paid' WHERE id = ?", (invoice_id,))
+
+    log_audit(db, "RECORD_PAYMENT", "payment", payment_id,
+              f"Recorded ₹{amount:.2f} ({payment_method}) on invoice {invoice['invoice_number'] or invoice_id}")
+    notify(db, current_user_id(), "payment_received",
+           f"Payment of ₹{amount:.2f} received for invoice {invoice['invoice_number'] or invoice_id}")
 
     db.commit()
     return jsonify({"success": True, "amount_paid": total_paid,
@@ -956,6 +1010,317 @@ def dashboard_data():
         "overdue_amount": scalar(f"SELECT COALESCE(SUM(total), 0) {base} AND invoices.status = 'Overdue'", (user_id,)),
         "overdue_count": scalar(f"SELECT COUNT(*) {base} AND invoices.status = 'Overdue'", (user_id,)),
         "total_invoices": scalar(f"SELECT COUNT(*) {base}", (user_id,)),
+    })
+
+
+@app.route("/api/dashboard/revenue-by-month", methods=["GET"])
+@login_required
+def revenue_by_month():
+    """Phase 11: data for the analytics chart - paid revenue grouped by
+    calendar month, most recent 6 months. strftime pulls YYYY-MM out of the
+    stored date string directly in SQL rather than in Python."""
+    db = get_db()
+    rows = db.execute(
+        """SELECT strftime('%Y-%m', invoices.invoice_date) AS month, SUM(invoices.total) AS revenue
+           FROM invoices JOIN customers ON invoices.customer_id = customers.id
+           WHERE customers.user_id = ? AND invoices.status = 'Paid'
+           GROUP BY month ORDER BY month DESC LIMIT 6""",
+        (current_user_id(),),
+    ).fetchall()
+    data = [{"month": r["month"], "revenue": round(r["revenue"], 2)} for r in rows]
+    data.reverse()  # chronological order for the chart, oldest to newest
+    return jsonify(data)
+
+
+# ---------------------------------------------------------------
+# API: audit log (Phase 7) - Admin only, read-only
+# ---------------------------------------------------------------
+@app.route("/api/audit-log", methods=["GET"])
+@login_required
+@role_required("Admin")
+def get_audit_log():
+    db = get_db()
+    page = max(int(request.args.get("page", 1)), 1)
+    limit = min(max(int(request.args.get("limit", 50)), 1), 200)
+    rows = db.execute(
+        "SELECT * FROM audit_log ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+        (limit, (page - 1) * limit),
+    ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+# ---------------------------------------------------------------
+# API: notifications (Phase 8)
+# ---------------------------------------------------------------
+@app.route("/api/notifications", methods=["GET"])
+@login_required
+def get_notifications():
+    db = get_db()
+    rows = db.execute(
+        "SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 50",
+        (current_user_id(),),
+    ).fetchall()
+    unread_count = db.execute(
+        "SELECT COUNT(*) AS c FROM notifications WHERE user_id = ? AND is_read = 0", (current_user_id(),)
+    ).fetchone()["c"]
+    return jsonify({"notifications": [dict(r) for r in rows], "unread_count": unread_count})
+
+
+@app.route("/api/notifications/<int:notif_id>/read", methods=["PATCH"])
+@login_required
+def mark_notification_read(notif_id):
+    db = get_db()
+    cur = db.execute(
+        "UPDATE notifications SET is_read = 1 WHERE id = ? AND user_id = ?", (notif_id, current_user_id())
+    )
+    db.commit()
+    if cur.rowcount == 0:
+        return jsonify({"error": "Notification not found"}), 404
+    return jsonify({"success": True})
+
+
+# ---------------------------------------------------------------
+# API: recurring invoices (Phase 10)
+# No Redis/cron here - "next_invoice_date" is checked and generated when
+# /api/recurring/run is called. In production this endpoint would be hit
+# by a scheduled job (cron, or a Render/GitHub Actions scheduled trigger)
+# once a day; for this project it can be triggered manually or by any
+# simple external scheduler that pings this URL.
+# ---------------------------------------------------------------
+@app.route("/api/recurring", methods=["GET"])
+@login_required
+def get_recurring_rules():
+    db = get_db()
+    rows = db.execute(
+        """SELECT recurring_rules.*, customers.name AS customer_name
+           FROM recurring_rules JOIN customers ON recurring_rules.customer_id = customers.id
+           WHERE recurring_rules.user_id = ? ORDER BY next_invoice_date""",
+        (current_user_id(),),
+    ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/recurring", methods=["POST"])
+@login_required
+@role_required("Admin", "Accountant")
+def create_recurring_rule():
+    data = request.get_json(force=True)
+    required = ["customer_id", "frequency", "item_name", "quantity", "price", "next_invoice_date"]
+    if not all(data.get(f) for f in required):
+        return jsonify({"error": f"Required fields: {', '.join(required)}"}), 400
+    if data["frequency"] not in ("Monthly", "Quarterly", "Yearly"):
+        return jsonify({"error": "frequency must be Monthly, Quarterly, or Yearly"}), 400
+
+    db = get_db()
+    owned = db.execute(
+        "SELECT id FROM customers WHERE id = ? AND user_id = ?", (data["customer_id"], current_user_id())
+    ).fetchone()
+    if owned is None:
+        return jsonify({"error": "Invalid customer"}), 400
+
+    cur = db.execute(
+        """INSERT INTO recurring_rules
+           (user_id, customer_id, frequency, item_name, quantity, price, tax_percent, next_invoice_date)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (current_user_id(), data["customer_id"], data["frequency"], data["item_name"],
+         data["quantity"], data["price"], data.get("tax_percent", 0), data["next_invoice_date"]),
+    )
+    db.commit()
+    return jsonify({"id": cur.lastrowid}), 201
+
+
+@app.route("/api/recurring/<int:rule_id>", methods=["DELETE"])
+@login_required
+@role_required("Admin", "Accountant")
+def delete_recurring_rule(rule_id):
+    db = get_db()
+    cur = db.execute(
+        "DELETE FROM recurring_rules WHERE id = ? AND user_id = ?", (rule_id, current_user_id())
+    )
+    db.commit()
+    if cur.rowcount == 0:
+        return jsonify({"error": "Rule not found"}), 404
+    return jsonify({"success": True})
+
+
+def advance_date(date_str, frequency):
+    """Bump a date forward by one billing cycle. Kept as a plain function
+    (not a method) so it's easy to unit test in isolation."""
+    d = datetime.strptime(date_str, "%Y-%m-%d").date()
+    if frequency == "Monthly":
+        month = d.month + 1
+        year = d.year + (month - 1) // 12
+        month = (month - 1) % 12 + 1
+        day = min(d.day, 28)  # sidesteps Feb 30th-type issues; simple and safe
+        return date(year, month, day).isoformat()
+    if frequency == "Quarterly":
+        for _ in range(3):
+            date_str = advance_date(date_str, "Monthly")
+        return date_str
+    if frequency == "Yearly":
+        return date(d.year + 1, d.month, min(d.day, 28)).isoformat()
+    return date_str
+
+
+@app.route("/api/recurring/run", methods=["POST"])
+@login_required
+@role_required("Admin", "Accountant")
+def run_recurring_invoices():
+    """Generates an invoice for every active rule whose next_invoice_date
+    has arrived, then advances that rule to its next date. Safe to call
+    repeatedly - a rule only fires once its date has actually passed."""
+    db = get_db()
+    today = date.today().isoformat()
+    due_rules = db.execute(
+        "SELECT * FROM recurring_rules WHERE user_id = ? AND is_active = 1 AND next_invoice_date <= ?",
+        (current_user_id(), today),
+    ).fetchall()
+
+    generated = []
+    for rule in due_rules:
+        items = [{"item_name": rule["item_name"], "quantity": rule["quantity"], "price": rule["price"]}]
+        subtotal, tax_amount, total = recalculate_totals(items, rule["tax_percent"])
+        invoice_number = generate_invoice_number(db)
+        due = advance_date(today, "Monthly")  # simple default: due in ~1 month
+        cur = db.execute(
+            """INSERT INTO invoices (invoice_number, customer_id, invoice_date, due_date,
+               tax_percent, subtotal, tax_amount, total, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Pending')""",
+            (invoice_number, rule["customer_id"], today, due, rule["tax_percent"], subtotal, tax_amount, total),
+        )
+        invoice_id = cur.lastrowid
+        db.execute(
+            "INSERT INTO invoice_items (invoice_id, item_name, quantity, price) VALUES (?, ?, ?, ?)",
+            (invoice_id, rule["item_name"], rule["quantity"], rule["price"]),
+        )
+        new_next_date = advance_date(rule["next_invoice_date"], rule["frequency"])
+        db.execute("UPDATE recurring_rules SET next_invoice_date = ? WHERE id = ?", (new_next_date, rule["id"]))
+        notify(db, current_user_id(), "invoice_created", f"Recurring invoice {invoice_number} auto-generated")
+        generated.append(invoice_number)
+
+    db.commit()
+    return jsonify({"generated": generated, "count": len(generated)})
+
+
+# ---------------------------------------------------------------
+# API: AI business assistant (Phase 13)
+# Deliberately NOT a free-text-to-SQL system. A real LLM asked to write
+# arbitrary SQL against a production database is a serious injection/
+# data-exfiltration risk - the prompt explicitly warns against this.
+# Instead: match the question to one of a small set of SAFE, predefined,
+# parameterized queries. This is the "safe query/intent layer" pattern -
+# the model (or here, simple keyword matching) only ever picks WHICH
+# pre-approved query to run, never WHAT SQL to run.
+# ---------------------------------------------------------------
+@app.route("/api/assistant/ask", methods=["POST"])
+@login_required
+def ask_assistant():
+    data = request.get_json(force=True)
+    question = (data.get("question") or "").lower()
+    db = get_db()
+    user_id = current_user_id()
+
+    if "overdue" in question:
+        rows = db.execute(
+            """SELECT customers.name, invoices.invoice_number, invoices.total FROM invoices
+               JOIN customers ON invoices.customer_id = customers.id
+               WHERE customers.user_id = ? AND invoices.status = 'Overdue'""", (user_id,)
+        ).fetchall()
+        if not rows:
+            return jsonify({"answer": "No overdue invoices right now.", "data": []})
+        lines = [f"{r['customer_name'] if 'customer_name' in r.keys() else r['name']} owes ₹{r['total']:.2f} on {r['invoice_number']}" for r in rows]
+        return jsonify({"answer": f"You have {len(rows)} overdue invoice(s): " + "; ".join(lines), "data": [dict(r) for r in rows]})
+
+    if "revenue" in question and ("last month" in question or "this month" in question):
+        target_month = date.today().strftime("%Y-%m") if "this month" in question else \
+            (date.today().replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+        row = db.execute(
+            """SELECT COALESCE(SUM(invoices.total), 0) AS revenue FROM invoices
+               JOIN customers ON invoices.customer_id = customers.id
+               WHERE customers.user_id = ? AND invoices.status = 'Paid'
+                 AND strftime('%Y-%m', invoices.invoice_date) = ?""",
+            (user_id, target_month),
+        ).fetchone()
+        return jsonify({"answer": f"Revenue for {target_month}: ₹{row['revenue']:.2f}", "data": {"month": target_month, "revenue": row["revenue"]}})
+
+    if "product" in question and ("most revenue" in question or "best selling" in question or "top" in question):
+        rows = db.execute(
+            """SELECT products.name, SUM(invoice_items.quantity * invoice_items.price) AS revenue
+               FROM invoice_items JOIN products ON invoice_items.product_id = products.id
+               WHERE products.user_id = ? GROUP BY products.id ORDER BY revenue DESC LIMIT 1""",
+            (user_id,),
+        ).fetchone()
+        if rows is None:
+            return jsonify({"answer": "No product sales recorded yet.", "data": None})
+        return jsonify({"answer": f"'{rows['name']}' generated the most revenue: ₹{rows['revenue']:.2f}", "data": dict(rows)})
+
+    if "above" in question or "over" in question:
+        import re
+        match = re.search(r"[₹$]?\s*(\d[\d,]*)", question)
+        threshold = float(match.group(1).replace(",", "")) if match else 0
+        rows = db.execute(
+            """SELECT invoices.invoice_number, invoices.total, customers.name FROM invoices
+               JOIN customers ON invoices.customer_id = customers.id
+               WHERE customers.user_id = ? AND invoices.total > ?""",
+            (user_id, threshold),
+        ).fetchall()
+        return jsonify({"answer": f"{len(rows)} invoice(s) above ₹{threshold:.0f}", "data": [dict(r) for r in rows]})
+
+    return jsonify({
+        "answer": "I can currently answer questions about: overdue invoices, revenue this/last month, "
+                   "best-selling products, and invoices above a given amount. Try rephrasing your question "
+                   "around one of those topics.",
+        "data": None,
+    })
+
+
+# ---------------------------------------------------------------
+# API: payment risk scoring (Phase 14)
+# A rule-based heuristic, NOT a trained ML model - there's no historical
+# dataset here to train one on. This is deliberately structured the same
+# way a real model's output would be consumed (a 0-100 score + reasons),
+# so swapping this function for a trained model later (e.g. scikit-learn
+# logistic regression) wouldn't require changing anything else.
+# ---------------------------------------------------------------
+@app.route("/api/customers/<int:customer_id>/risk-score", methods=["GET"])
+@login_required
+def get_customer_risk_score(customer_id):
+    db = get_db()
+    customer = db.execute(
+        "SELECT * FROM customers WHERE id = ? AND user_id = ?", (customer_id, current_user_id())
+    ).fetchone()
+    if customer is None:
+        return jsonify({"error": "Customer not found"}), 404
+
+    invoices = db.execute("SELECT * FROM invoices WHERE customer_id = ?", (customer_id,)).fetchall()
+    total_invoices = len(invoices)
+    overdue_count = sum(1 for inv in invoices if inv["status"] == "Overdue")
+    avg_amount = sum(inv["total"] for inv in invoices) / total_invoices if total_invoices else 0
+
+    score = 0
+    reasons = []
+    if total_invoices > 0:
+        overdue_ratio = overdue_count / total_invoices
+        if overdue_ratio > 0.3:
+            score += 40
+            reasons.append(f"{overdue_count} of {total_invoices} invoices have been overdue")
+        if avg_amount > 50000:
+            score += 20
+            reasons.append(f"High average invoice amount (₹{avg_amount:.0f})")
+        if overdue_count >= 3:
+            score += 20
+            reasons.append("Multiple overdue invoices on record")
+        if total_invoices < 2:
+            score += 10
+            reasons.append("Limited payment history to judge reliability")
+    score = min(score, 100)
+
+    return jsonify({
+        "customer_id": customer_id,
+        "customer_name": customer["name"],
+        "risk_score": score,
+        "risk_label": "High" if score >= 60 else "Medium" if score >= 30 else "Low",
+        "reasons": reasons or ["No risk indicators found"],
     })
 
 

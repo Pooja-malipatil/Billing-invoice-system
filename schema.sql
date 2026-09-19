@@ -105,6 +105,49 @@ CREATE TABLE IF NOT EXISTS stock_movements (
 );
 
 -- Indexes to keep filtered/joined queries fast as data grows
+-- 7) AUDIT LOG -----------------------------------------------------
+-- WHO did WHAT to WHICH record, WHEN. Append-only, never edited or deleted.
+CREATE TABLE IF NOT EXISTS audit_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL,
+    username    TEXT NOT NULL,       -- denormalized on purpose: if the user
+                                       -- account is later deleted, the log
+                                       -- entry still says who did it
+    action      TEXT NOT NULL,       -- e.g. 'DELETE_CUSTOMER', 'RECORD_PAYMENT'
+    entity      TEXT NOT NULL,       -- e.g. 'customer', 'invoice', 'payment'
+    entity_id   INTEGER,
+    details     TEXT,                -- short human-readable summary
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 8) NOTIFICATIONS -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS notifications (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL,
+    type        TEXT NOT NULL,        -- 'invoice_created','payment_received','overdue','low_stock'
+    message     TEXT NOT NULL,
+    is_read     INTEGER NOT NULL DEFAULT 0,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- 9) RECURRING INVOICE RULES -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS recurring_rules (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id           INTEGER NOT NULL,
+    customer_id       INTEGER NOT NULL,
+    frequency         TEXT NOT NULL CHECK (frequency IN ('Monthly', 'Quarterly', 'Yearly')),
+    item_name         TEXT NOT NULL,
+    quantity          REAL NOT NULL,
+    price             REAL NOT NULL,
+    tax_percent       REAL NOT NULL DEFAULT 0,
+    next_invoice_date TEXT NOT NULL,
+    is_active         INTEGER NOT NULL DEFAULT 1,
+    created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (customer_id) REFERENCES customers(id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_customers_user ON customers(user_id);
 CREATE INDEX IF NOT EXISTS idx_invoices_customer ON invoices(customer_id);
 CREATE INDEX IF NOT EXISTS idx_invoices_status   ON invoices(status);
@@ -112,3 +155,6 @@ CREATE INDEX IF NOT EXISTS idx_items_invoice      ON invoice_items(invoice_id);
 CREATE INDEX IF NOT EXISTS idx_payments_invoice   ON payments(invoice_id);
 CREATE INDEX IF NOT EXISTS idx_products_user       ON products(user_id);
 CREATE INDEX IF NOT EXISTS idx_stock_moves_product  ON stock_movements(product_id);
+CREATE INDEX IF NOT EXISTS idx_audit_user           ON audit_log(user_id);
+CREATE INDEX IF NOT EXISTS idx_notifications_user   ON notifications(user_id, is_read);
+CREATE INDEX IF NOT EXISTS idx_recurring_user       ON recurring_rules(user_id);
