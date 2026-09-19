@@ -100,7 +100,8 @@ def login_required(view):
 
         g.user_id = user["id"]
         g.username = user["username"]
-        g.role = user["role"]  # always fresh from the DB, never from the cached token
+        g.role = user["role"]      # always fresh from the DB, never from the cached token
+        g.org_id = user["org_id"]  # the tenant boundary - fresh from DB for the same reason as role
         return view(*args, **kwargs)
     return wrapped
 
@@ -123,6 +124,10 @@ def role_required(*allowed_roles):
 
 def current_user_id():
     return g.user_id
+
+
+def current_org_id():
+    return g.org_id
 
 
 @app.context_processor
@@ -163,7 +168,7 @@ def init_db():
 init_db()  # runs at import time so gunicorn (production) also creates tables
 
 
-def mark_overdue_invoices(db, user_id):
+def mark_overdue_invoices(db, org_id):
     today = date.today().isoformat()
     # Find which invoices are ABOUT to flip, before updating, so we know
     # exactly which ones to notify about (not every already-overdue one).
@@ -171,19 +176,27 @@ def mark_overdue_invoices(db, user_id):
         """SELECT invoices.id, invoices.invoice_number, customers.name AS customer_name
            FROM invoices JOIN customers ON invoices.customer_id = customers.id
            WHERE invoices.status = 'Pending' AND invoices.due_date < ?
-             AND customers.user_id = ?""",
-        (today, user_id),
+             AND customers.org_id = ?""",
+        (today, org_id),
     ).fetchall()
 
     db.execute(
         """UPDATE invoices SET status = 'Overdue'
            WHERE status = 'Pending' AND due_date < ?
-             AND customer_id IN (SELECT id FROM customers WHERE user_id = ?)""",
-        (today, user_id),
+             AND customer_id IN (SELECT id FROM customers WHERE org_id = ?)""",
+        (today, org_id),
     )
-    for inv in newly_overdue:
-        label = inv["invoice_number"] or f"#{inv['id']}"
-        notify(db, user_id, "overdue", f"Invoice {label} for {inv['customer_name']} is now overdue")
+    if newly_overdue:
+        # Notify every Admin/Accountant in the org, not just whoever
+        # happened to trigger this check - overdue invoices are everyone's
+        # business, not just the person who happened to load the page.
+        recipients = db.execute(
+            "SELECT id FROM users WHERE org_id = ? AND role IN ('Admin', 'Accountant')", (org_id,)
+        ).fetchall()
+        for inv in newly_overdue:
+            label = inv["invoice_number"] or f"#{inv['id']}"
+            for r in recipients:
+                notify(db, r["id"], "overdue", f"Invoice {label} for {inv['customer_name']} is now overdue")
     db.commit()
 
 
@@ -194,12 +207,12 @@ def recalculate_totals(items, tax_percent):
     return round(subtotal, 2), round(tax_amount, 2), round(total, 2)
 
 
-def get_owned_invoice(db, invoice_id, user_id):
+def get_owned_invoice(db, invoice_id, org_id):
     return db.execute(
         """SELECT invoices.*, customers.name AS customer_name
            FROM invoices JOIN customers ON invoices.customer_id = customers.id
-           WHERE invoices.id = ? AND customers.user_id = ?""",
-        (invoice_id, user_id),
+           WHERE invoices.id = ? AND customers.org_id = ?""",
+        (invoice_id, org_id),
     ).fetchone()
 
 
@@ -233,14 +246,19 @@ def adjust_stock(db, product_id, change_amount, reason):
     if change_amount < 0:
         product = db.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
         if product and product["stock_quantity"] <= product["low_stock_threshold"]:
-            notify(db, product["user_id"], "low_stock",
-                   f"'{product['name']}' is low on stock: {product['stock_quantity']} left "
-                   f"(threshold {product['low_stock_threshold']})")
+            recipients = db.execute(
+                "SELECT id FROM users WHERE org_id = ? AND role IN ('Admin', 'Accountant')",
+                (product["org_id"],),
+            ).fetchall()
+            for r in recipients:
+                notify(db, r["id"], "low_stock",
+                       f"'{product['name']}' is low on stock: {product['stock_quantity']} left "
+                       f"(threshold {product['low_stock_threshold']})")
 
 
-def get_owned_product(db, product_id, user_id):
+def get_owned_product(db, product_id, org_id):
     return db.execute(
-        "SELECT * FROM products WHERE id = ? AND user_id = ?", (product_id, user_id)
+        "SELECT * FROM products WHERE id = ? AND org_id = ?", (product_id, org_id)
     ).fetchone()
 
 
@@ -261,8 +279,8 @@ def log_audit(db, action, entity, entity_id, details=""):
     real change, in the same transaction/commit, so the log entry and the
     actual change succeed or fail together - never one without the other."""
     db.execute(
-        "INSERT INTO audit_log (user_id, username, action, entity, entity_id, details) VALUES (?, ?, ?, ?, ?, ?)",
-        (g.user_id, g.username, action, entity, entity_id, details),
+        "INSERT INTO audit_log (org_id, user_id, username, action, entity, entity_id, details) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (g.org_id, g.user_id, g.username, action, entity, entity_id, details),
     )
 
 
@@ -283,6 +301,7 @@ def register_page():
 
     username = request.form.get("username", "").strip()
     password = request.form.get("password", "")
+    org_name = request.form.get("org_name", "").strip() or f"{username}'s Organization"
 
     if not username or not password:
         return render_template("register.html", error="Username and password are required.")
@@ -294,23 +313,28 @@ def register_page():
     if existing:
         return render_template("register.html", error="That username is already taken.")
 
-    # First user ever registered becomes Admin automatically (a common
-    # bootstrapping pattern - someone has to be Admin #1). Everyone after
-    # that defaults to Sales Staff; an Admin can be promoted later via the
-    # /api/v1/users/<id>/role endpoint below.
-    user_count = db.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
-    role = "Admin" if user_count == 0 else "Sales Staff"
+    # Public /register always creates a BRAND NEW organization/company
+    # account - this is deliberate. Existing companies add teammates
+    # through the Admin-only invite endpoint below (POST
+    # /api/v1/organizations/invite), not through public self-registration.
+    # This mirrors real B2B SaaS signup: anyone can sign up and start a new
+    # company account, but you can't just register your way into someone
+    # ELSE's company data.
+    org_cur = db.execute("INSERT INTO organizations (name) VALUES (?)", (org_name,))
+    org_id = org_cur.lastrowid
 
+    # The person who creates a new organization is always its first Admin -
+    # someone has to be able to manage it, and they're the only one there.
     password_hash = generate_password_hash(password)
     cur = db.execute(
-        "INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)",
-        (username, password_hash, role),
+        "INSERT INTO users (org_id, username, password_hash, role) VALUES (?, ?, ?, ?)",
+        (org_id, username, password_hash, "Admin"),
     )
     db.commit()
 
     session["user_id"] = cur.lastrowid
     session["username"] = username
-    session["role"] = role
+    session["role"] = "Admin"
     return redirect(url_for("dashboard_page"))
 
 
@@ -374,13 +398,69 @@ def change_user_role(target_user_id):
         return jsonify({"error": "Invalid role"}), 400
 
     db = get_db()
-    cur = db.execute("UPDATE users SET role = ? WHERE id = ?", (new_role, target_user_id))
+    # CRITICAL: must also check org_id, not just the user id - otherwise
+    # an Admin from Organization A could change the role of a user in
+    # Organization B just by guessing their user id. This is exactly the
+    # kind of cross-tenant bug multi-tenant systems have to guard against
+    # on every single query that touches another table's row by id.
+    cur = db.execute(
+        "UPDATE users SET role = ? WHERE id = ? AND org_id = ?",
+        (new_role, target_user_id, current_org_id()),
+    )
     if cur.rowcount == 0:
         db.rollback()
         return jsonify({"error": "User not found"}), 404
     log_audit(db, "CHANGE_USER_ROLE", "user", target_user_id, f"Changed role to {new_role}")
     db.commit()
     return jsonify({"success": True})
+
+
+@app.route("/api/v1/organizations/invite", methods=["POST"])
+@login_required
+@role_required("Admin")
+def invite_teammate():
+    """Admin-only: create a new user account already assigned to the
+    Admin's own organization. This is how a company adds Accountants and
+    Sales Staff to their SHARED data - not via public self-registration
+    (which always creates a brand new, separate organization instead)."""
+    data = request.get_json(force=True)
+    username = (data.get("username") or "").strip()
+    password = data.get("password", "")
+    role = data.get("role", "Sales Staff")
+
+    if not username or not password:
+        return jsonify({"error": "Username and password are required"}), 400
+    if len(password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters"}), 400
+    if role not in ("Admin", "Accountant", "Sales Staff"):
+        return jsonify({"error": "Invalid role"}), 400
+
+    db = get_db()
+    existing = db.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
+    if existing:
+        return jsonify({"error": "That username is already taken"}), 400
+
+    password_hash = generate_password_hash(password)
+    cur = db.execute(
+        "INSERT INTO users (org_id, username, password_hash, role) VALUES (?, ?, ?, ?)",
+        (current_org_id(), username, password_hash, role),
+    )
+    log_audit(db, "INVITE_TEAMMATE", "user", cur.lastrowid, f"Invited '{username}' as {role}")
+    db.commit()
+    return jsonify({"id": cur.lastrowid, "username": username, "role": role}), 201
+
+
+@app.route("/api/v1/organizations/users", methods=["GET"])
+@login_required
+def list_org_users():
+    """Everyone in the org can see their teammates (name + role) - useful
+    for the UI, and there's nothing sensitive in a username/role pairing."""
+    db = get_db()
+    rows = db.execute(
+        "SELECT id, username, role, created_at FROM users WHERE org_id = ? ORDER BY username",
+        (current_org_id(),),
+    ).fetchall()
+    return jsonify([dict(r) for r in rows])
 
 
 # ---------------------------------------------------------------
@@ -425,8 +505,8 @@ def edit_invoice_page(invoice_id):
 def get_customers():
     db = get_db()
     rows = db.execute(
-        "SELECT * FROM customers WHERE user_id = ? ORDER BY name COLLATE NOCASE",
-        (current_user_id(),),
+        "SELECT * FROM customers WHERE org_id = ? ORDER BY name COLLATE NOCASE",
+        (current_org_id(),),
     ).fetchall()
     return jsonify([dict(r) for r in rows])
 
@@ -436,8 +516,8 @@ def get_customers():
 def get_customer(customer_id):
     db = get_db()
     row = db.execute(
-        "SELECT * FROM customers WHERE id = ? AND user_id = ?",
-        (customer_id, current_user_id()),
+        "SELECT * FROM customers WHERE id = ? AND org_id = ?",
+        (customer_id, current_org_id()),
     ).fetchone()
     if row is None:
         return jsonify({"error": "Customer not found"}), 404
@@ -450,7 +530,7 @@ def get_customer_stats(customer_id):
     """Phase 5: full billing history summary for one customer."""
     db = get_db()
     customer = db.execute(
-        "SELECT * FROM customers WHERE id = ? AND user_id = ?", (customer_id, current_user_id())
+        "SELECT * FROM customers WHERE id = ? AND org_id = ?", (customer_id, current_org_id())
     ).fetchone()
     if customer is None:
         return jsonify({"error": "Customer not found"}), 404
@@ -472,7 +552,6 @@ def get_customer_stats(customer_id):
     })
 
 
-
 @app.route("/api/customers", methods=["POST"])
 @login_required
 def add_customer():
@@ -483,8 +562,8 @@ def add_customer():
 
     db = get_db()
     cur = db.execute(
-        "INSERT INTO customers (user_id, name, email, phone, address) VALUES (?, ?, ?, ?, ?)",
-        (current_user_id(), name, data.get("email", "").strip(),
+        "INSERT INTO customers (org_id, user_id, name, email, phone, address) VALUES (?, ?, ?, ?, ?, ?)",
+        (current_org_id(), current_user_id(), name, data.get("email", "").strip(),
          data.get("phone", "").strip(), data.get("address", "").strip()),
     )
     db.commit()
@@ -501,9 +580,9 @@ def update_customer(customer_id):
 
     db = get_db()
     cur = db.execute(
-        "UPDATE customers SET name = ?, email = ?, phone = ?, address = ? WHERE id = ? AND user_id = ?",
+        "UPDATE customers SET name = ?, email = ?, phone = ?, address = ? WHERE id = ? AND org_id = ?",
         (name, data.get("email", ""), data.get("phone", ""), data.get("address", ""),
-         customer_id, current_user_id()),
+         customer_id, current_org_id()),
     )
     db.commit()
     if cur.rowcount == 0:
@@ -516,11 +595,13 @@ def update_customer(customer_id):
 @role_required("Admin")   # <-- RBAC in action: only Admin can delete customers
 def delete_customer(customer_id):
     db = get_db()
-    customer = db.execute("SELECT name FROM customers WHERE id = ?", (customer_id,)).fetchone()
+    customer = db.execute(
+        "SELECT name FROM customers WHERE id = ? AND org_id = ?", (customer_id, current_org_id())
+    ).fetchone()
     try:
         cur = db.execute(
-            "DELETE FROM customers WHERE id = ? AND user_id = ?",
-            (customer_id, current_user_id()),
+            "DELETE FROM customers WHERE id = ? AND org_id = ?",
+            (customer_id, current_org_id()),
         )
     except sqlite3.IntegrityError:
         db.rollback()
@@ -544,8 +625,8 @@ def delete_customer(customer_id):
 def get_products():
     db = get_db()
     rows = db.execute(
-        "SELECT * FROM products WHERE user_id = ? ORDER BY name COLLATE NOCASE",
-        (current_user_id(),),
+        "SELECT * FROM products WHERE org_id = ? ORDER BY name COLLATE NOCASE",
+        (current_org_id(),),
     ).fetchall()
     products = []
     for r in rows:
@@ -559,7 +640,7 @@ def get_products():
 @login_required
 def get_product(product_id):
     db = get_db()
-    product = get_owned_product(db, product_id, current_user_id())
+    product = get_owned_product(db, product_id, current_org_id())
     if product is None:
         return jsonify({"error": "Product not found"}), 404
     result = dict(product)
@@ -581,16 +662,16 @@ def create_product():
     try:
         cur = db.execute(
             """INSERT INTO products
-               (user_id, sku, name, description, price, tax_percent,
+               (org_id, user_id, sku, name, description, price, tax_percent,
                 stock_quantity, low_stock_threshold, is_active)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (current_user_id(), sku, name, data.get("description", ""),
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (current_org_id(), current_user_id(), sku, name, data.get("description", ""),
              float(data.get("price", 0)), float(data.get("tax_percent", 0)),
              int(data.get("stock_quantity", 0)), int(data.get("low_stock_threshold", 5)),
              1 if data.get("is_active", True) else 0),
         )
     except sqlite3.IntegrityError:
-        # Fires because of our UNIQUE(user_id, sku) constraint in schema.sql
+        # Fires because of our UNIQUE(org_id, sku) constraint in schema.sql
         return jsonify({"error": f"SKU '{sku}' already exists in your catalog"}), 400
 
     product_id = cur.lastrowid
@@ -611,7 +692,7 @@ def create_product():
 @role_required("Admin")
 def update_product(product_id):
     db = get_db()
-    if get_owned_product(db, product_id, current_user_id()) is None:
+    if get_owned_product(db, product_id, current_org_id()) is None:
         return jsonify({"error": "Product not found"}), 404
 
     data = request.get_json(force=True)
@@ -619,9 +700,6 @@ def update_product(product_id):
     if not name:
         return jsonify({"error": "Name is required"}), 400
 
-    # Note: stock_quantity is intentionally NOT editable here - it should
-    # only ever change through adjust_stock() (a sale or a deliberate
-    # adjustment), never by silently overwriting it in a generic update.
     db.execute(
         """UPDATE products SET name = ?, description = ?, price = ?, tax_percent = ?,
            low_stock_threshold = ?, is_active = ? WHERE id = ?""",
@@ -638,11 +716,8 @@ def update_product(product_id):
 @role_required("Admin")
 def delete_product(product_id):
     db = get_db()
-    if get_owned_product(db, product_id, current_user_id()) is None:
+    if get_owned_product(db, product_id, current_org_id()) is None:
         return jsonify({"error": "Product not found"}), 404
-    # No try/except needed here: invoice_items.product_id uses ON DELETE
-    # SET NULL (see schema.sql), so this never fails - past invoices just
-    # lose their link to this product instead of blocking the delete.
     db.execute("DELETE FROM products WHERE id = ?", (product_id,))
     db.commit()
     return jsonify({"success": True})
@@ -656,7 +731,7 @@ def adjust_product_stock(product_id):
     physical inventory count correction. Always goes through adjust_stock()
     so it's logged exactly like an automatic sale-driven change."""
     db = get_db()
-    product = get_owned_product(db, product_id, current_user_id())
+    product = get_owned_product(db, product_id, current_org_id())
     if product is None:
         return jsonify({"error": "Product not found"}), 404
 
@@ -679,7 +754,7 @@ def adjust_product_stock(product_id):
 @login_required
 def get_stock_history(product_id):
     db = get_db()
-    if get_owned_product(db, product_id, current_user_id()) is None:
+    if get_owned_product(db, product_id, current_org_id()) is None:
         return jsonify({"error": "Product not found"}), 404
     rows = db.execute(
         "SELECT * FROM stock_movements WHERE product_id = ? ORDER BY created_at DESC, id DESC",
@@ -691,14 +766,14 @@ def get_stock_history(product_id):
 # ---------------------------------------------------------------
 # API: invoices
 # ---------------------------------------------------------------
-def build_invoice_query(user_id, search, status):
+def build_invoice_query(org_id, search, status):
     query = """
         SELECT invoices.*, customers.name AS customer_name
         FROM invoices
         JOIN customers ON invoices.customer_id = customers.id
-        WHERE customers.user_id = ?
+        WHERE customers.org_id = ?
     """
-    params = [user_id]
+    params = [org_id]
     if search:
         query += " AND customers.name LIKE ?"
         params.append(f"%{search}%")
@@ -712,7 +787,7 @@ def build_invoice_query(user_id, search, status):
 @login_required
 def get_invoices():
     db = get_db()
-    mark_overdue_invoices(db, current_user_id())
+    mark_overdue_invoices(db, current_org_id())
 
     search = request.args.get("search", "").strip()
     status = request.args.get("status", "").strip()
@@ -720,7 +795,7 @@ def get_invoices():
     limit = min(max(int(request.args.get("limit", 20)), 1), 100)  # cap at 100 to prevent abuse
     offset = (page - 1) * limit
 
-    query, params = build_invoice_query(current_user_id(), search, status)
+    query, params = build_invoice_query(current_org_id(), search, status)
     count_row = db.execute(query.replace("SELECT invoices.*, customers.name AS customer_name", "SELECT COUNT(*) AS c"), params).fetchone()
     total_count = count_row["c"]
 
@@ -749,7 +824,7 @@ def get_invoices():
 @login_required
 def get_invoice(invoice_id):
     db = get_db()
-    invoice = get_owned_invoice(db, invoice_id, current_user_id())
+    invoice = get_owned_invoice(db, invoice_id, current_org_id())
     if invoice is None:
         return jsonify({"error": "Invoice not found"}), 404
 
@@ -780,7 +855,7 @@ def create_invoice():
 
     db = get_db()
     owned = db.execute(
-        "SELECT id FROM customers WHERE id = ? AND user_id = ?", (customer_id, current_user_id())
+        "SELECT id FROM customers WHERE id = ? AND org_id = ?", (customer_id, current_org_id())
     ).fetchone()
     if owned is None:
         return jsonify({"error": "Invalid customer"}), 400
@@ -791,7 +866,7 @@ def create_invoice():
     for item in items:
         product_id = item.get("product_id")
         if product_id:
-            product = get_owned_product(db, product_id, current_user_id())
+            product = get_owned_product(db, product_id, current_org_id())
             if product is None:
                 return jsonify({"error": f"Invalid product_id {product_id}"}), 400
             if product["stock_quantity"] < item["quantity"]:
@@ -832,7 +907,7 @@ def create_invoice():
 @login_required
 def update_invoice(invoice_id):
     db = get_db()
-    if get_owned_invoice(db, invoice_id, current_user_id()) is None:
+    if get_owned_invoice(db, invoice_id, current_org_id()) is None:
         return jsonify({"error": "Invoice not found"}), 404
 
     data = request.get_json(force=True)
@@ -882,7 +957,7 @@ def update_invoice(invoice_id):
 @login_required
 def update_invoice_status(invoice_id):
     db = get_db()
-    if get_owned_invoice(db, invoice_id, current_user_id()) is None:
+    if get_owned_invoice(db, invoice_id, current_org_id()) is None:
         return jsonify({"error": "Invoice not found"}), 404
 
     data = request.get_json(force=True)
@@ -899,7 +974,7 @@ def update_invoice_status(invoice_id):
 @role_required("Admin")   # only Admin can delete invoices
 def delete_invoice(invoice_id):
     db = get_db()
-    invoice = get_owned_invoice(db, invoice_id, current_user_id())
+    invoice = get_owned_invoice(db, invoice_id, current_org_id())
     if invoice is None:
         return jsonify({"error": "Invoice not found"}), 404
 
@@ -926,7 +1001,7 @@ def delete_invoice(invoice_id):
 @role_required("Admin", "Accountant")
 def add_payment(invoice_id):
     db = get_db()
-    invoice = get_owned_invoice(db, invoice_id, current_user_id())
+    invoice = get_owned_invoice(db, invoice_id, current_org_id())
     if invoice is None:
         return jsonify({"error": "Invoice not found"}), 404
 
@@ -972,8 +1047,8 @@ def delete_payment(payment_id):
         """SELECT payments.id, payments.invoice_id FROM payments
            JOIN invoices ON payments.invoice_id = invoices.id
            JOIN customers ON invoices.customer_id = customers.id
-           WHERE payments.id = ? AND customers.user_id = ?""",
-        (payment_id, current_user_id()),
+           WHERE payments.id = ? AND customers.org_id = ?""",
+        (payment_id, current_org_id()),
     ).fetchone()
     if row is None:
         return jsonify({"error": "Payment not found"}), 404
@@ -996,20 +1071,20 @@ def delete_payment(payment_id):
 @login_required
 def dashboard_data():
     db = get_db()
-    user_id = current_user_id()
-    mark_overdue_invoices(db, user_id)
+    org_id = current_org_id()
+    mark_overdue_invoices(db, org_id)
 
     def scalar(sql, params):
         return db.execute(sql, params).fetchone()[0]
 
-    base = "FROM invoices JOIN customers ON invoices.customer_id = customers.id WHERE customers.user_id = ?"
+    base = "FROM invoices JOIN customers ON invoices.customer_id = customers.id WHERE customers.org_id = ?"
 
     return jsonify({
-        "total_revenue": scalar(f"SELECT COALESCE(SUM(total), 0) {base} AND invoices.status = 'Paid'", (user_id,)),
-        "total_pending": scalar(f"SELECT COALESCE(SUM(total), 0) {base} AND invoices.status = 'Pending'", (user_id,)),
-        "overdue_amount": scalar(f"SELECT COALESCE(SUM(total), 0) {base} AND invoices.status = 'Overdue'", (user_id,)),
-        "overdue_count": scalar(f"SELECT COUNT(*) {base} AND invoices.status = 'Overdue'", (user_id,)),
-        "total_invoices": scalar(f"SELECT COUNT(*) {base}", (user_id,)),
+        "total_revenue": scalar(f"SELECT COALESCE(SUM(total), 0) {base} AND invoices.status = 'Paid'", (org_id,)),
+        "total_pending": scalar(f"SELECT COALESCE(SUM(total), 0) {base} AND invoices.status = 'Pending'", (org_id,)),
+        "overdue_amount": scalar(f"SELECT COALESCE(SUM(total), 0) {base} AND invoices.status = 'Overdue'", (org_id,)),
+        "overdue_count": scalar(f"SELECT COUNT(*) {base} AND invoices.status = 'Overdue'", (org_id,)),
+        "total_invoices": scalar(f"SELECT COUNT(*) {base}", (org_id,)),
     })
 
 
@@ -1023,9 +1098,9 @@ def revenue_by_month():
     rows = db.execute(
         """SELECT strftime('%Y-%m', invoices.invoice_date) AS month, SUM(invoices.total) AS revenue
            FROM invoices JOIN customers ON invoices.customer_id = customers.id
-           WHERE customers.user_id = ? AND invoices.status = 'Paid'
+           WHERE customers.org_id = ? AND invoices.status = 'Paid'
            GROUP BY month ORDER BY month DESC LIMIT 6""",
-        (current_user_id(),),
+        (current_org_id(),),
     ).fetchall()
     data = [{"month": r["month"], "revenue": round(r["revenue"], 2)} for r in rows]
     data.reverse()  # chronological order for the chart, oldest to newest
@@ -1043,8 +1118,8 @@ def get_audit_log():
     page = max(int(request.args.get("page", 1)), 1)
     limit = min(max(int(request.args.get("limit", 50)), 1), 200)
     rows = db.execute(
-        "SELECT * FROM audit_log ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
-        (limit, (page - 1) * limit),
+        "SELECT * FROM audit_log WHERE org_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+        (current_org_id(), limit, (page - 1) * limit),
     ).fetchall()
     return jsonify([dict(r) for r in rows])
 
@@ -1094,8 +1169,8 @@ def get_recurring_rules():
     rows = db.execute(
         """SELECT recurring_rules.*, customers.name AS customer_name
            FROM recurring_rules JOIN customers ON recurring_rules.customer_id = customers.id
-           WHERE recurring_rules.user_id = ? ORDER BY next_invoice_date""",
-        (current_user_id(),),
+           WHERE recurring_rules.org_id = ? ORDER BY next_invoice_date""",
+        (current_org_id(),),
     ).fetchall()
     return jsonify([dict(r) for r in rows])
 
@@ -1113,16 +1188,16 @@ def create_recurring_rule():
 
     db = get_db()
     owned = db.execute(
-        "SELECT id FROM customers WHERE id = ? AND user_id = ?", (data["customer_id"], current_user_id())
+        "SELECT id FROM customers WHERE id = ? AND org_id = ?", (data["customer_id"], current_org_id())
     ).fetchone()
     if owned is None:
         return jsonify({"error": "Invalid customer"}), 400
 
     cur = db.execute(
         """INSERT INTO recurring_rules
-           (user_id, customer_id, frequency, item_name, quantity, price, tax_percent, next_invoice_date)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (current_user_id(), data["customer_id"], data["frequency"], data["item_name"],
+           (org_id, user_id, customer_id, frequency, item_name, quantity, price, tax_percent, next_invoice_date)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (current_org_id(), current_user_id(), data["customer_id"], data["frequency"], data["item_name"],
          data["quantity"], data["price"], data.get("tax_percent", 0), data["next_invoice_date"]),
     )
     db.commit()
@@ -1135,7 +1210,7 @@ def create_recurring_rule():
 def delete_recurring_rule(rule_id):
     db = get_db()
     cur = db.execute(
-        "DELETE FROM recurring_rules WHERE id = ? AND user_id = ?", (rule_id, current_user_id())
+        "DELETE FROM recurring_rules WHERE id = ? AND org_id = ?", (rule_id, current_org_id())
     )
     db.commit()
     if cur.rowcount == 0:
@@ -1172,8 +1247,8 @@ def run_recurring_invoices():
     db = get_db()
     today = date.today().isoformat()
     due_rules = db.execute(
-        "SELECT * FROM recurring_rules WHERE user_id = ? AND is_active = 1 AND next_invoice_date <= ?",
-        (current_user_id(), today),
+        "SELECT * FROM recurring_rules WHERE org_id = ? AND is_active = 1 AND next_invoice_date <= ?",
+        (current_org_id(), today),
     ).fetchall()
 
     generated = []
@@ -1218,13 +1293,13 @@ def ask_assistant():
     data = request.get_json(force=True)
     question = (data.get("question") or "").lower()
     db = get_db()
-    user_id = current_user_id()
+    org_id = current_org_id()
 
     if "overdue" in question:
         rows = db.execute(
             """SELECT customers.name, invoices.invoice_number, invoices.total FROM invoices
                JOIN customers ON invoices.customer_id = customers.id
-               WHERE customers.user_id = ? AND invoices.status = 'Overdue'""", (user_id,)
+               WHERE customers.org_id = ? AND invoices.status = 'Overdue'""", (org_id,)
         ).fetchall()
         if not rows:
             return jsonify({"answer": "No overdue invoices right now.", "data": []})
@@ -1237,9 +1312,9 @@ def ask_assistant():
         row = db.execute(
             """SELECT COALESCE(SUM(invoices.total), 0) AS revenue FROM invoices
                JOIN customers ON invoices.customer_id = customers.id
-               WHERE customers.user_id = ? AND invoices.status = 'Paid'
+               WHERE customers.org_id = ? AND invoices.status = 'Paid'
                  AND strftime('%Y-%m', invoices.invoice_date) = ?""",
-            (user_id, target_month),
+            (org_id, target_month),
         ).fetchone()
         return jsonify({"answer": f"Revenue for {target_month}: ₹{row['revenue']:.2f}", "data": {"month": target_month, "revenue": row["revenue"]}})
 
@@ -1247,8 +1322,8 @@ def ask_assistant():
         rows = db.execute(
             """SELECT products.name, SUM(invoice_items.quantity * invoice_items.price) AS revenue
                FROM invoice_items JOIN products ON invoice_items.product_id = products.id
-               WHERE products.user_id = ? GROUP BY products.id ORDER BY revenue DESC LIMIT 1""",
-            (user_id,),
+               WHERE products.org_id = ? GROUP BY products.id ORDER BY revenue DESC LIMIT 1""",
+            (org_id,),
         ).fetchone()
         if rows is None:
             return jsonify({"answer": "No product sales recorded yet.", "data": None})
@@ -1261,8 +1336,8 @@ def ask_assistant():
         rows = db.execute(
             """SELECT invoices.invoice_number, invoices.total, customers.name FROM invoices
                JOIN customers ON invoices.customer_id = customers.id
-               WHERE customers.user_id = ? AND invoices.total > ?""",
-            (user_id, threshold),
+               WHERE customers.org_id = ? AND invoices.total > ?""",
+            (org_id, threshold),
         ).fetchall()
         return jsonify({"answer": f"{len(rows)} invoice(s) above ₹{threshold:.0f}", "data": [dict(r) for r in rows]})
 
