@@ -35,6 +35,15 @@ def register(client, username="alice", password="secret123"):
     return client.post("/register", data={"username": username, "password": password})
 
 
+def invite_teammate(client, username, password="secret123", role="Sales Staff"):
+    """Adds a teammate to the CURRENT session's organization - this is how
+    multiple users end up sharing the same data, unlike /register which
+    always creates a brand new organization."""
+    return client.post("/api/v1/organizations/invite", json={
+        "username": username, "password": password, "role": role,
+    })
+
+
 def make_customer(client, name="Acme Corp"):
     r = client.post("/api/customers", json={"name": name})
     return r.get_json()["id"]
@@ -43,21 +52,38 @@ def make_customer(client, name="Acme Corp"):
 # ---------------------------------------------------------------
 # Auth & RBAC
 # ---------------------------------------------------------------
-def test_first_user_becomes_admin(client):
+def test_registering_creates_a_new_organization_as_admin(client):
     register(client, "alice")
     r = client.get("/api/customers")  # any authenticated call works
     assert r.status_code == 200
 
 
-def test_second_user_defaults_to_sales_staff(client):
+def test_invited_teammate_shares_the_same_org_data(client):
+    """The core multi-tenant behavior: an Admin invites a teammate, and
+    that teammate sees the SAME customers - not a separate empty list."""
     register(client, "alice")
+    make_customer(client, "Shared Customer")
+    invite_teammate(client, "carol", role="Accountant")
+
     import app as app_module
     with app_module.app.test_client() as c2:
-        register(c2, "bob")
-        # Sales Staff cannot delete - proves the role stuck
-        cid = make_customer(c2)
-        r = c2.delete(f"/api/customers/{cid}")
-        assert r.status_code == 403
+        c2.post("/login", data={"username": "carol", "password": "secret123"})
+        r = c2.get("/api/customers")
+        names = [c["name"] for c in r.get_json()]
+        assert "Shared Customer" in names  # carol sees alice's data - same org
+
+
+def test_second_public_registration_gets_own_separate_org(client):
+    """Two people who both hit /register (never invited by each other)
+    must NOT share data - they run separate companies."""
+    register(client, "alice")
+    make_customer(client, "Alice's Customer")
+
+    import app as app_module
+    with app_module.app.test_client() as c2:
+        register(c2, "independent_bob")  # public signup, not an invite
+        r = c2.get("/api/customers")
+        assert r.get_json() == []  # completely empty - different org entirely
 
 
 def test_unauthenticated_request_is_rejected(client):
@@ -74,11 +100,26 @@ def test_sales_staff_cannot_record_payment(client):
     })
     inv_id = r.get_json()["id"]
 
+    invite_teammate(client, "dave", role="Sales Staff")
     import app as app_module
     with app_module.app.test_client() as c2:
-        register(c2, "bob")  # Sales Staff
+        c2.post("/login", data={"username": "dave", "password": "secret123"})
         r = c2.post(f"/api/invoices/{inv_id}/payments", json={"amount": 50, "paid_on": "2026-07-05"})
         assert r.status_code == 403
+
+
+def test_admin_cannot_change_role_of_user_in_different_org(client):
+    """Cross-tenant security check: an Admin should never be able to
+    modify a user who belongs to a DIFFERENT organization, even by
+    guessing their numeric user id."""
+    register(client, "alice")  # org 1, user id 1, Admin
+
+    import app as app_module
+    c2 = app_module.app.test_client()
+    register(c2, "eve")  # org 2, user id 2, Admin of her OWN org
+    # alice (org 1 Admin) tries to change eve's role (org 2 user)
+    r = client.patch("/api/v1/users/2/role", json={"role": "Sales Staff"})
+    assert r.status_code == 404  # not found from alice's org's point of view
 
 
 # ---------------------------------------------------------------

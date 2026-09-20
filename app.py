@@ -1362,7 +1362,7 @@ def ask_assistant():
 def get_customer_risk_score(customer_id):
     db = get_db()
     customer = db.execute(
-        "SELECT * FROM customers WHERE id = ? AND user_id = ?", (customer_id, current_user_id())
+        "SELECT * FROM customers WHERE id = ? AND org_id = ?", (customer_id, current_org_id())
     ).fetchone()
     if customer is None:
         return jsonify({"error": "Customer not found"}), 404
@@ -1406,10 +1406,10 @@ def get_customer_risk_score(customer_id):
 @login_required
 def export_invoices_csv():
     db = get_db()
-    mark_overdue_invoices(db, current_user_id())
+    mark_overdue_invoices(db, current_org_id())
     search = request.args.get("search", "").strip()
     status = request.args.get("status", "").strip()
-    query, params = build_invoice_query(current_user_id(), search, status)
+    query, params = build_invoice_query(current_org_id(), search, status)
     query += " ORDER BY invoices.invoice_date DESC"
     rows = db.execute(query, params).fetchall()
 
@@ -1437,7 +1437,7 @@ def export_invoice_pdf(invoice_id):
     from reportlab.lib.styles import getSampleStyleSheet
 
     db = get_db()
-    invoice = get_owned_invoice(db, invoice_id, current_user_id())
+    invoice = get_owned_invoice(db, invoice_id, current_org_id())
     if invoice is None:
         return jsonify({"error": "Invoice not found"}), 404
 

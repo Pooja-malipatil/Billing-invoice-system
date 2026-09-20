@@ -1,29 +1,47 @@
 PRAGMA foreign_keys = ON;
 
+-- -1) ORGANIZATIONS -------------------------------------------------
+-- The tenant boundary. Every user belongs to exactly one organization.
+-- Data (customers, products, recurring rules) belongs to the ORGANIZATION,
+-- not to an individual user - so an Admin, an Accountant, and a Sales
+-- Staff member at the same company all see the SAME shared data, with
+-- their role controlling what actions each can take on it. This is what
+-- makes RBAC actually meaningful: before this, each user had their own
+-- private data silo, which made roles pointless (an Accountant had
+-- nothing to be an Accountant OF).
+CREATE TABLE IF NOT EXISTS organizations (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 -- 0) USERS ---------------------------------------------------
--- Every customer (and therefore every invoice, via the customer) belongs to
--- exactly one user, so users only ever see their own billing data.
--- `role` drives Role-Based Access Control (RBAC) - checked server-side on
--- every sensitive action, not just hidden in the UI.
 CREATE TABLE IF NOT EXISTS users (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id         INTEGER NOT NULL,
     username       TEXT NOT NULL UNIQUE,
     password_hash  TEXT NOT NULL,
     role           TEXT NOT NULL DEFAULT 'Sales Staff'
                    CHECK (role IN ('Admin', 'Accountant', 'Sales Staff')),
-    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE
 );
 
 -- 1) CUSTOMERS -------------------------------------------------
+-- org_id is the REAL ownership/access boundary now. user_id is kept only
+-- as "created_by" - useful to know who added a record, but NOT used for
+-- access control anymore (that would defeat the point of shared org data).
 CREATE TABLE IF NOT EXISTS customers (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id     INTEGER NOT NULL,
+    org_id      INTEGER NOT NULL,
+    user_id     INTEGER,             -- created_by, informational only
     name        TEXT NOT NULL,
     email       TEXT,
     phone       TEXT,
     address     TEXT,
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
 );
 
 -- 2) INVOICES ----------------------------------------------------
@@ -76,7 +94,8 @@ CREATE TABLE IF NOT EXISTS payments (
 -- customers - scoped by user_id, checked on every query).
 CREATE TABLE IF NOT EXISTS products (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id             INTEGER NOT NULL,
+    org_id              INTEGER NOT NULL,
+    user_id             INTEGER,     -- created_by, informational only
     sku                 TEXT NOT NULL,
     name                TEXT NOT NULL,
     description         TEXT,
@@ -86,8 +105,9 @@ CREATE TABLE IF NOT EXISTS products (
     low_stock_threshold INTEGER NOT NULL DEFAULT 5,
     is_active           INTEGER NOT NULL DEFAULT 1,  -- SQLite has no boolean type; 1=true, 0=false
     created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-    UNIQUE (user_id, sku)  -- SKU must be unique within one user's catalog, not globally
+    FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
+    UNIQUE (org_id, sku)  -- SKU unique within one org's catalog, not globally
 );
 
 -- 6) STOCK_MOVEMENTS -------------------------------------------------
@@ -109,6 +129,8 @@ CREATE TABLE IF NOT EXISTS stock_movements (
 -- WHO did WHAT to WHICH record, WHEN. Append-only, never edited or deleted.
 CREATE TABLE IF NOT EXISTS audit_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id      INTEGER NOT NULL,     -- so an Admin only ever sees THEIR org's
+                                       -- audit trail, never another tenant's
     user_id     INTEGER NOT NULL,
     username    TEXT NOT NULL,       -- denormalized on purpose: if the user
                                        -- account is later deleted, the log
@@ -134,7 +156,8 @@ CREATE TABLE IF NOT EXISTS notifications (
 -- 9) RECURRING INVOICE RULES -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS recurring_rules (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id           INTEGER NOT NULL,
+    org_id            INTEGER NOT NULL,
+    user_id           INTEGER,      -- created_by, informational only
     customer_id       INTEGER NOT NULL,
     frequency         TEXT NOT NULL CHECK (frequency IN ('Monthly', 'Quarterly', 'Yearly')),
     item_name         TEXT NOT NULL,
@@ -144,9 +167,16 @@ CREATE TABLE IF NOT EXISTS recurring_rules (
     next_invoice_date TEXT NOT NULL,
     is_active         INTEGER NOT NULL DEFAULT 1,
     created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
     FOREIGN KEY (customer_id) REFERENCES customers(id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_customers_org ON customers(org_id);
+CREATE INDEX IF NOT EXISTS idx_products_org ON products(org_id);
+CREATE INDEX IF NOT EXISTS idx_recurring_org ON recurring_rules(org_id);
+CREATE INDEX IF NOT EXISTS idx_audit_org ON audit_log(org_id);
+CREATE INDEX IF NOT EXISTS idx_users_org ON users(org_id);
 
 CREATE INDEX IF NOT EXISTS idx_customers_user ON customers(user_id);
 CREATE INDEX IF NOT EXISTS idx_invoices_customer ON invoices(customer_id);
