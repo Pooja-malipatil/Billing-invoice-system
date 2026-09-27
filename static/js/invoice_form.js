@@ -53,16 +53,16 @@ taxInput.addEventListener("input", recalculate);
 document.getElementById("btn-add-item").addEventListener("click", () => addItemRow());
 
 async function loadCustomers(selectedId = null) {
-  const customers = await apiFetch("/api/customers");
+  const customers = await apiFetch("/api/v1/customers");
   customerSelect.innerHTML = customers.map((c) => `<option value="${c.id}">${escapeHtml(c.name)}</option>`).join("");
   if (selectedId) customerSelect.value = selectedId;
 }
 async function loadProducts() {
-  try { availableProducts = await apiFetch("/api/products"); } catch (err) { availableProducts = []; }
+  try { availableProducts = await apiFetch("/api/v1/products"); } catch (err) { availableProducts = []; }
 }
 
 async function loadExistingInvoice() {
-  const invoice = await apiFetch(`/api/invoices/${invoiceId}`);
+  const invoice = await apiFetch(`/api/v1/invoices/${invoiceId}`);
   await loadCustomers(invoice.customer_id);
   document.getElementById("invoice-date").value = invoice.invoice_date;
   document.getElementById("due-date").value = invoice.due_date;
@@ -71,7 +71,25 @@ async function loadExistingInvoice() {
   removeAllRows();
   invoice.items.forEach((item) => addItemRow(item));
   renderPayments(invoice.payments, invoice.total);
+  await loadVersionHistory();
 }
+
+async function loadVersionHistory() {
+  const tbody = document.getElementById("versions-tbody");
+  const emptyState = document.getElementById("versions-empty");
+  if (!tbody) return;
+  try {
+    const versions = await apiFetch(`/api/v1/invoices/${invoiceId}/versions`);
+    tbody.innerHTML = "";
+    emptyState.style.display = versions.length === 0 ? "block" : "none";
+    versions.forEach((v) => {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td>v${v.version_number}</td><td>${escapeHtml(v.changed_by)}</td><td>${v.created_at}</td><td>${formatCurrency(v.total)}</td><td>${v.status}</td>`;
+      tbody.appendChild(tr);
+    });
+  } catch (err) { /* silent - version history is supplementary info */ }
+}
+
 function setDefaultDates() {
   const today = new Date().toISOString().split("T")[0];
   document.getElementById("invoice-date").value = today;
@@ -96,8 +114,8 @@ form.addEventListener("submit", async (e) => {
     items,
   };
   try {
-    if (invoiceId) { await apiFetch(`/api/invoices/${invoiceId}`, { method: "PUT", body: JSON.stringify(payload) }); showToast("Invoice updated"); }
-    else { await apiFetch("/api/invoices", { method: "POST", body: JSON.stringify(payload) }); showToast("Invoice created"); }
+    if (invoiceId) { await apiFetch(`/api/v1/invoices/${invoiceId}`, { method: "PUT", body: JSON.stringify(payload) }); showToast("Invoice updated"); }
+    else { await apiFetch("/api/v1/invoices", { method: "POST", body: JSON.stringify(payload) }); showToast("Invoice created"); }
     window.location.href = "/invoices";
   } catch (err) { showToast(err.message, true); }
 });
@@ -121,7 +139,7 @@ function renderPayments(payments, total) {
 }
 async function deletePayment(id) {
   if (!confirm("Delete this payment record?")) return;
-  try { await apiFetch(`/api/payments/${id}`, { method: "DELETE" }); showToast("Payment deleted"); await loadExistingInvoice(); }
+  try { await apiFetch(`/api/v1/payments/${id}`, { method: "DELETE" }); showToast("Payment deleted"); await loadExistingInvoice(); }
   catch (err) { showToast(err.message, true); }
 }
 const paymentForm = document.getElementById("payment-form");
@@ -137,7 +155,7 @@ if (paymentForm) {
       note: document.getElementById("payment-note").value.trim(),
     };
     try {
-      await apiFetch(`/api/invoices/${invoiceId}/payments`, { method: "POST", body: JSON.stringify(payload) });
+      await apiFetch(`/api/v1/invoices/${invoiceId}/payments`, { method: "POST", body: JSON.stringify(payload) });
       showToast("Payment recorded"); paymentForm.reset();
       document.getElementById("payment-date").value = new Date().toISOString().split("T")[0];
       await loadExistingInvoice();

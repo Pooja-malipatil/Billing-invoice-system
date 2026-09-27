@@ -216,6 +216,27 @@ def get_owned_invoice(db, invoice_id, org_id):
     ).fetchone()
 
 
+def record_ledger_transaction(db, org_id, invoice_id, debit_account, credit_account, amount, description):
+    """
+    The ONLY function that writes to ledger_entries. Every call writes
+    exactly TWO rows - a debit and a credit, same amount - which is the
+    fundamental rule of double-entry bookkeeping: money never appears or
+    disappears, it only moves between accounts. Because both rows are
+    written together, it is mathematically impossible for this function to
+    ever leave debits and credits out of balance.
+    """
+    if amount <= 0:
+        return  # a zero-amount "transaction" isn't a transaction
+    db.execute(
+        "INSERT INTO ledger_entries (org_id, invoice_id, entry_type, account, amount, description) VALUES (?, ?, 'debit', ?, ?, ?)",
+        (org_id, invoice_id, debit_account, amount, description),
+    )
+    db.execute(
+        "INSERT INTO ledger_entries (org_id, invoice_id, entry_type, account, amount, description) VALUES (?, ?, 'credit', ?, ?, ?)",
+        (org_id, invoice_id, credit_account, amount, description),
+    )
+
+
 def get_amount_paid(db, invoice_id):
     row = db.execute(
         "SELECT COALESCE(SUM(amount), 0) AS paid FROM payments WHERE invoice_id = ?",
@@ -478,6 +499,38 @@ def customers_page():
     return render_template("customers.html")
 
 
+@app.route("/products")
+@login_required
+def products_page():
+    return render_template("products.html")
+
+
+@app.route("/recurring")
+@login_required
+def recurring_page():
+    return render_template("recurring.html")
+
+
+@app.route("/audit-log")
+@login_required
+@role_required("Admin")
+def audit_log_page():
+    return render_template("audit_log.html")
+
+
+@app.route("/assistant")
+@login_required
+def assistant_page():
+    return render_template("assistant.html")
+
+
+@app.route("/ledger")
+@login_required
+@role_required("Admin", "Accountant")
+def ledger_page():
+    return render_template("ledger.html")
+
+
 @app.route("/invoices")
 @login_required
 def invoices_page():
@@ -500,7 +553,7 @@ def edit_invoice_page(invoice_id):
 # API: customers
 # All authenticated roles can view. Only Admin can delete (RBAC example).
 # ---------------------------------------------------------------
-@app.route("/api/customers", methods=["GET"])
+@app.route("/api/v1/customers", methods=["GET"])
 @login_required
 def get_customers():
     db = get_db()
@@ -511,7 +564,7 @@ def get_customers():
     return jsonify([dict(r) for r in rows])
 
 
-@app.route("/api/customers/<int:customer_id>", methods=["GET"])
+@app.route("/api/v1/customers/<int:customer_id>", methods=["GET"])
 @login_required
 def get_customer(customer_id):
     db = get_db()
@@ -524,7 +577,7 @@ def get_customer(customer_id):
     return jsonify(dict(row))
 
 
-@app.route("/api/customers/<int:customer_id>/stats", methods=["GET"])
+@app.route("/api/v1/customers/<int:customer_id>/stats", methods=["GET"])
 @login_required
 def get_customer_stats(customer_id):
     """Phase 5: full billing history summary for one customer."""
@@ -552,7 +605,7 @@ def get_customer_stats(customer_id):
     })
 
 
-@app.route("/api/customers", methods=["POST"])
+@app.route("/api/v1/customers", methods=["POST"])
 @login_required
 def add_customer():
     data = request.get_json(force=True)
@@ -570,7 +623,7 @@ def add_customer():
     return jsonify({"id": cur.lastrowid}), 201
 
 
-@app.route("/api/customers/<int:customer_id>", methods=["PUT"])
+@app.route("/api/v1/customers/<int:customer_id>", methods=["PUT"])
 @login_required
 def update_customer(customer_id):
     data = request.get_json(force=True)
@@ -590,7 +643,7 @@ def update_customer(customer_id):
     return jsonify({"success": True})
 
 
-@app.route("/api/customers/<int:customer_id>", methods=["DELETE"])
+@app.route("/api/v1/customers/<int:customer_id>", methods=["DELETE"])
 @login_required
 @role_required("Admin")   # <-- RBAC in action: only Admin can delete customers
 def delete_customer(customer_id):
@@ -620,7 +673,7 @@ def delete_customer(customer_id):
 # stock/prices to build an invoice). Only Admin can create/edit/delete -
 # same reasoning as customers: catalog and pricing are sensitive.
 # ---------------------------------------------------------------
-@app.route("/api/products", methods=["GET"])
+@app.route("/api/v1/products", methods=["GET"])
 @login_required
 def get_products():
     db = get_db()
@@ -636,7 +689,7 @@ def get_products():
     return jsonify(products)
 
 
-@app.route("/api/products/<int:product_id>", methods=["GET"])
+@app.route("/api/v1/products/<int:product_id>", methods=["GET"])
 @login_required
 def get_product(product_id):
     db = get_db()
@@ -648,7 +701,7 @@ def get_product(product_id):
     return jsonify(result)
 
 
-@app.route("/api/products", methods=["POST"])
+@app.route("/api/v1/products", methods=["POST"])
 @login_required
 @role_required("Admin")
 def create_product():
@@ -687,7 +740,7 @@ def create_product():
     return jsonify({"id": product_id}), 201
 
 
-@app.route("/api/products/<int:product_id>", methods=["PUT"])
+@app.route("/api/v1/products/<int:product_id>", methods=["PUT"])
 @login_required
 @role_required("Admin")
 def update_product(product_id):
@@ -711,7 +764,7 @@ def update_product(product_id):
     return jsonify({"success": True})
 
 
-@app.route("/api/products/<int:product_id>", methods=["DELETE"])
+@app.route("/api/v1/products/<int:product_id>", methods=["DELETE"])
 @login_required
 @role_required("Admin")
 def delete_product(product_id):
@@ -723,7 +776,7 @@ def delete_product(product_id):
     return jsonify({"success": True})
 
 
-@app.route("/api/products/<int:product_id>/adjust-stock", methods=["POST"])
+@app.route("/api/v1/products/<int:product_id>/adjust-stock", methods=["POST"])
 @login_required
 @role_required("Admin", "Accountant")
 def adjust_product_stock(product_id):
@@ -750,7 +803,7 @@ def adjust_product_stock(product_id):
     return jsonify({"success": True})
 
 
-@app.route("/api/products/<int:product_id>/stock-history", methods=["GET"])
+@app.route("/api/v1/products/<int:product_id>/stock-history", methods=["GET"])
 @login_required
 def get_stock_history(product_id):
     db = get_db()
@@ -783,7 +836,7 @@ def build_invoice_query(org_id, search, status):
     return query, params
 
 
-@app.route("/api/invoices", methods=["GET"])
+@app.route("/api/v1/invoices", methods=["GET"])
 @login_required
 def get_invoices():
     db = get_db()
@@ -820,7 +873,7 @@ def get_invoices():
     })
 
 
-@app.route("/api/invoices/<int:invoice_id>", methods=["GET"])
+@app.route("/api/v1/invoices/<int:invoice_id>", methods=["GET"])
 @login_required
 def get_invoice(invoice_id):
     db = get_db()
@@ -841,7 +894,7 @@ def get_invoice(invoice_id):
     return jsonify(result)
 
 
-@app.route("/api/invoices", methods=["POST"])
+@app.route("/api/v1/invoices", methods=["POST"])
 @login_required
 def create_invoice():
     data = request.get_json(force=True)
@@ -898,16 +951,25 @@ def create_invoice():
             # Stock goes DOWN (negative change) because this invoice sold it.
             adjust_stock(db, product_id, -item["quantity"], f"Invoice #{invoice_id} created")
 
+    # Issuing an invoice means the customer now owes us money: their debt
+    # to us goes UP (debit Accounts Receivable) and our recognized revenue
+    # goes UP by the exact same amount (credit Revenue). Skipped for Draft
+    # invoices, since a draft hasn't actually been issued to the customer yet.
+    if data.get("status", "Draft") != "Draft":
+        record_ledger_transaction(db, current_org_id(), invoice_id, "accounts_receivable", "revenue",
+                                   total, f"Invoice {invoice_number} issued")
+
     notify(db, current_user_id(), "invoice_created", f"Invoice {invoice_number} created for ₹{total:.2f}")
     db.commit()
     return jsonify({"id": invoice_id}), 201
 
 
-@app.route("/api/invoices/<int:invoice_id>", methods=["PUT"])
+@app.route("/api/v1/invoices/<int:invoice_id>", methods=["PUT"])
 @login_required
 def update_invoice(invoice_id):
     db = get_db()
-    if get_owned_invoice(db, invoice_id, current_org_id()) is None:
+    old_invoice = get_owned_invoice(db, invoice_id, current_org_id())
+    if old_invoice is None:
         return jsonify({"error": "Invoice not found"}), 404
 
     data = request.get_json(force=True)
@@ -917,6 +979,22 @@ def update_invoice(invoice_id):
 
     tax_percent = data.get("tax_percent", 0)
     subtotal, tax_amount, total = recalculate_totals(items, tax_percent)
+
+    # Snapshot the invoice's state as it was BEFORE this edit. This is what
+    # makes it possible to later answer "what did this look like before,
+    # and who changed it" - without this, an edit just silently overwrites
+    # history with no trace of what used to be there.
+    next_version = db.execute(
+        "SELECT COALESCE(MAX(version_number), 0) + 1 AS v FROM invoice_versions WHERE invoice_id = ?",
+        (invoice_id,),
+    ).fetchone()["v"]
+    db.execute(
+        """INSERT INTO invoice_versions
+           (invoice_id, version_number, changed_by, subtotal, tax_amount, total, status, invoice_date, due_date)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (invoice_id, next_version, g.username, old_invoice["subtotal"], old_invoice["tax_amount"],
+         old_invoice["total"], old_invoice["status"], old_invoice["invoice_date"], old_invoice["due_date"]),
+    )
 
     db.execute(
         """UPDATE invoices
@@ -949,11 +1027,36 @@ def update_invoice(invoice_id):
         if product_id:
             adjust_stock(db, product_id, -item["quantity"], f"Invoice #{invoice_id} edited (applying new item)")
 
+    # Same reversal pattern as stock: undo the OLD ledger effect (if the
+    # invoice had been issued), then record the NEW one at the new total.
+    # This keeps the ledger's debit/credit balance intact through an edit,
+    # instead of just silently changing a number with no financial trail.
+    new_status = data.get("status", "Pending")
+    if old_invoice["status"] != "Draft":
+        record_ledger_transaction(db, current_org_id(), invoice_id, "revenue", "accounts_receivable",
+                                   old_invoice["total"], f"Invoice #{invoice_id} edited (reversing old amount)")
+    if new_status != "Draft":
+        record_ledger_transaction(db, current_org_id(), invoice_id, "accounts_receivable", "revenue",
+                                   total, f"Invoice #{invoice_id} edited (new amount)")
+
     db.commit()
     return jsonify({"success": True})
 
 
-@app.route("/api/invoices/<int:invoice_id>/status", methods=["PATCH"])
+@app.route("/api/v1/invoices/<int:invoice_id>/versions", methods=["GET"])
+@login_required
+def get_invoice_versions(invoice_id):
+    db = get_db()
+    if get_owned_invoice(db, invoice_id, current_org_id()) is None:
+        return jsonify({"error": "Invoice not found"}), 404
+    rows = db.execute(
+        "SELECT * FROM invoice_versions WHERE invoice_id = ? ORDER BY version_number DESC",
+        (invoice_id,),
+    ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/v1/invoices/<int:invoice_id>/status", methods=["PATCH"])
 @login_required
 def update_invoice_status(invoice_id):
     db = get_db()
@@ -969,7 +1072,7 @@ def update_invoice_status(invoice_id):
     return jsonify({"success": True})
 
 
-@app.route("/api/invoices/<int:invoice_id>", methods=["DELETE"])
+@app.route("/api/v1/invoices/<int:invoice_id>", methods=["DELETE"])
 @login_required
 @role_required("Admin")   # only Admin can delete invoices
 def delete_invoice(invoice_id):
@@ -985,7 +1088,22 @@ def delete_invoice(invoice_id):
         if item["product_id"]:
             adjust_stock(db, item["product_id"], item["quantity"], f"Invoice #{invoice_id} deleted")
 
-    db.execute("DELETE FROM invoices WHERE id = ?", (invoice_id,))
+    try:
+        db.execute("DELETE FROM invoices WHERE id = ?", (invoice_id,))
+    except sqlite3.IntegrityError:
+        # Fires because ledger_entries has a foreign key to this invoice
+        # with NO cascade - deliberately. Real financial systems never
+        # hard-delete a record that has money movement logged against it;
+        # the correct action is to Cancel it (a status change, which stays
+        # fully reversible and auditable), not erase the row. Draft
+        # invoices (never issued, no ledger entries yet) can still be
+        # deleted freely - this only blocks invoices with real history.
+        db.rollback()
+        return jsonify({
+            "error": "This invoice has financial ledger history and cannot be deleted. "
+                     "Set its status to Cancelled instead to preserve the audit trail."
+        }), 400
+
     log_audit(db, "DELETE_INVOICE", "invoice", invoice_id,
               f"Deleted invoice {invoice['invoice_number'] or invoice_id} (₹{invoice['total']:.2f})")
     db.commit()
@@ -996,7 +1114,7 @@ def delete_invoice(invoice_id):
 # API: payments - Admin or Accountant only (Sales Staff can view invoices
 # but shouldn't be recording money received - a realistic RBAC boundary)
 # ---------------------------------------------------------------
-@app.route("/api/invoices/<int:invoice_id>/payments", methods=["POST"])
+@app.route("/api/v1/invoices/<int:invoice_id>/payments", methods=["POST"])
 @login_required
 @role_required("Admin", "Accountant")
 def add_payment(invoice_id):
@@ -1013,16 +1131,47 @@ def add_payment(invoice_id):
     if amount <= 0:
         return jsonify({"error": "Payment amount must be greater than zero"}), 400
 
+    # Idempotency check: a client can send a unique key with a payment
+    # request (e.g. generated once when the "Pay" button is clicked). If
+    # that exact request is retried - say the network hiccuped and the
+    # client's HTTP call timed out even though our server DID process it -
+    # we recognize the key and return the ORIGINAL result instead of
+    # recording the money twice. This is the same mechanism Stripe's API
+    # uses on its payment endpoints.
+    idempotency_key = (data.get("idempotency_key") or "").strip() or None
+    if idempotency_key:
+        existing = db.execute(
+            "SELECT * FROM payments WHERE idempotency_key = ?", (idempotency_key,)
+        ).fetchone()
+        if existing:
+            total_paid = get_amount_paid(db, invoice_id)
+            return jsonify({
+                "success": True, "duplicate_request": True,
+                "amount_paid": total_paid, "amount_due": round(invoice["total"] - total_paid, 2),
+            }), 200  # 200, not 201 - nothing new was created
+
     paid_on = data.get("paid_on") or date.today().isoformat()
     payment_method = (data.get("payment_method") or "Cash").strip()
     reference_id = (data.get("reference_id") or "").strip()
     note = (data.get("note") or "").strip()
 
-    cur = db.execute(
-        "INSERT INTO payments (invoice_id, amount, paid_on, payment_method, reference_id, note) VALUES (?, ?, ?, ?, ?, ?)",
-        (invoice_id, amount, paid_on, payment_method, reference_id, note),
-    )
+    try:
+        cur = db.execute(
+            "INSERT INTO payments (invoice_id, amount, paid_on, payment_method, reference_id, note, idempotency_key) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (invoice_id, amount, paid_on, payment_method, reference_id, note, idempotency_key),
+        )
+    except sqlite3.IntegrityError:
+        # Extremely rare race: two requests with the same key arrived at
+        # nearly the same instant and both passed the check above before
+        # either committed. The UNIQUE constraint on idempotency_key is the
+        # real safety net here - the check above is just the fast path.
+        return jsonify({"error": "This payment was already processed (duplicate request)"}), 409
     payment_id = cur.lastrowid
+
+    # Receiving money: our Cash goes UP, and the customer's outstanding
+    # debt to us (Accounts Receivable) goes DOWN - by the same amount.
+    record_ledger_transaction(db, current_org_id(), invoice_id, "cash", "accounts_receivable",
+                               amount, f"Payment received on invoice {invoice['invoice_number'] or invoice_id}")
 
     total_paid = get_amount_paid(db, invoice_id)
     if total_paid >= invoice["total"]:
@@ -1034,17 +1183,17 @@ def add_payment(invoice_id):
            f"Payment of ₹{amount:.2f} received for invoice {invoice['invoice_number'] or invoice_id}")
 
     db.commit()
-    return jsonify({"success": True, "amount_paid": total_paid,
+    return jsonify({"success": True, "duplicate_request": False, "amount_paid": total_paid,
                      "amount_due": round(invoice["total"] - total_paid, 2)}), 201
 
 
-@app.route("/api/payments/<int:payment_id>", methods=["DELETE"])
+@app.route("/api/v1/payments/<int:payment_id>", methods=["DELETE"])
 @login_required
 @role_required("Admin", "Accountant")
 def delete_payment(payment_id):
     db = get_db()
     row = db.execute(
-        """SELECT payments.id, payments.invoice_id FROM payments
+        """SELECT payments.id, payments.invoice_id, payments.amount, invoices.invoice_number FROM payments
            JOIN invoices ON payments.invoice_id = invoices.id
            JOIN customers ON invoices.customer_id = customers.id
            WHERE payments.id = ? AND customers.org_id = ?""",
@@ -1054,6 +1203,13 @@ def delete_payment(payment_id):
         return jsonify({"error": "Payment not found"}), 404
 
     db.execute("DELETE FROM payments WHERE id = ?", (payment_id,))
+
+    # Reverse the ledger effect: the original payment debited Cash and
+    # credited Accounts Receivable, so undoing it does the exact opposite -
+    # the customer's debt goes back up, and recorded Cash goes back down.
+    record_ledger_transaction(db, current_org_id(), row["invoice_id"], "accounts_receivable", "cash",
+                               row["amount"], f"Payment reversed on invoice {row['invoice_number'] or row['invoice_id']}")
+
     invoice = db.execute("SELECT * FROM invoices WHERE id = ?", (row["invoice_id"],)).fetchone()
     total_paid = get_amount_paid(db, row["invoice_id"])
     if invoice["status"] == "Paid" and total_paid < invoice["total"]:
@@ -1065,9 +1221,84 @@ def delete_payment(payment_id):
 
 
 # ---------------------------------------------------------------
-# API: dashboard
+# API: ledger (double-entry bookkeeping)
 # ---------------------------------------------------------------
-@app.route("/api/dashboard", methods=["GET"])
+@app.route("/api/v1/ledger", methods=["GET"])
+@login_required
+@role_required("Admin", "Accountant")
+def get_ledger():
+    db = get_db()
+    rows = db.execute(
+        """SELECT ledger_entries.*, invoices.invoice_number FROM ledger_entries
+           JOIN invoices ON ledger_entries.invoice_id = invoices.id
+           WHERE ledger_entries.org_id = ? ORDER BY ledger_entries.created_at DESC, ledger_entries.id DESC LIMIT 200""",
+        (current_org_id(),),
+    ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/v1/ledger/balances", methods=["GET"])
+@login_required
+@role_required("Admin", "Accountant")
+def get_ledger_balances():
+    """Current balance of each account, derived entirely from the ledger -
+    never stored as a separate editable number. Accounts Receivable should
+    always equal total outstanding (unpaid) invoice amount; Cash should
+    equal total money actually received; Revenue should equal total
+    invoiced amount. These three numbers being internally consistent IS
+    the point of double-entry bookkeeping."""
+    db = get_db()
+    org_id = current_org_id()
+    balances = {}
+    for account in ("accounts_receivable", "cash", "revenue"):
+        debits = db.execute(
+            "SELECT COALESCE(SUM(amount), 0) AS t FROM ledger_entries WHERE org_id = ? AND account = ? AND entry_type = 'debit'",
+            (org_id, account),
+        ).fetchone()["t"]
+        credits = db.execute(
+            "SELECT COALESCE(SUM(amount), 0) AS t FROM ledger_entries WHERE org_id = ? AND account = ? AND entry_type = 'credit'",
+            (org_id, account),
+        ).fetchone()["t"]
+        # Asset accounts (AR, Cash) increase on debit; Revenue increases on
+        # credit - standard accounting convention.
+        if account == "revenue":
+            balances[account] = round(credits - debits, 2)
+        else:
+            balances[account] = round(debits - credits, 2)
+    return jsonify(balances)
+
+
+@app.route("/api/v1/ledger/verify", methods=["GET"])
+@login_required
+@role_required("Admin", "Accountant")
+def verify_ledger():
+    """
+    The actual correctness proof: sums every debit and every credit ever
+    recorded for this organization and confirms they are EXACTLY equal.
+    If record_ledger_transaction() is the only place that ever writes to
+    this table (which it is), this can mathematically never be false -
+    but checking it explicitly, rather than just trusting the invariant,
+    is exactly the kind of verification a real financial system runs.
+    """
+    db = get_db()
+    org_id = current_org_id()
+    total_debits = db.execute(
+        "SELECT COALESCE(SUM(amount), 0) AS t FROM ledger_entries WHERE org_id = ? AND entry_type = 'debit'", (org_id,)
+    ).fetchone()["t"]
+    total_credits = db.execute(
+        "SELECT COALESCE(SUM(amount), 0) AS t FROM ledger_entries WHERE org_id = ? AND entry_type = 'credit'", (org_id,)
+    ).fetchone()["t"]
+    balanced = round(total_debits, 2) == round(total_credits, 2)
+    return jsonify({
+        "balanced": balanced,
+        "total_debits": round(total_debits, 2),
+        "total_credits": round(total_credits, 2),
+        "difference": round(total_debits - total_credits, 2),
+    })
+
+
+
+@app.route("/api/v1/dashboard", methods=["GET"])
 @login_required
 def dashboard_data():
     db = get_db()
@@ -1088,7 +1319,7 @@ def dashboard_data():
     })
 
 
-@app.route("/api/dashboard/revenue-by-month", methods=["GET"])
+@app.route("/api/v1/dashboard/revenue-by-month", methods=["GET"])
 @login_required
 def revenue_by_month():
     """Phase 11: data for the analytics chart - paid revenue grouped by
@@ -1110,7 +1341,7 @@ def revenue_by_month():
 # ---------------------------------------------------------------
 # API: audit log (Phase 7) - Admin only, read-only
 # ---------------------------------------------------------------
-@app.route("/api/audit-log", methods=["GET"])
+@app.route("/api/v1/audit-log", methods=["GET"])
 @login_required
 @role_required("Admin")
 def get_audit_log():
@@ -1127,7 +1358,7 @@ def get_audit_log():
 # ---------------------------------------------------------------
 # API: notifications (Phase 8)
 # ---------------------------------------------------------------
-@app.route("/api/notifications", methods=["GET"])
+@app.route("/api/v1/notifications", methods=["GET"])
 @login_required
 def get_notifications():
     db = get_db()
@@ -1141,7 +1372,7 @@ def get_notifications():
     return jsonify({"notifications": [dict(r) for r in rows], "unread_count": unread_count})
 
 
-@app.route("/api/notifications/<int:notif_id>/read", methods=["PATCH"])
+@app.route("/api/v1/notifications/<int:notif_id>/read", methods=["PATCH"])
 @login_required
 def mark_notification_read(notif_id):
     db = get_db()
@@ -1162,7 +1393,7 @@ def mark_notification_read(notif_id):
 # once a day; for this project it can be triggered manually or by any
 # simple external scheduler that pings this URL.
 # ---------------------------------------------------------------
-@app.route("/api/recurring", methods=["GET"])
+@app.route("/api/v1/recurring", methods=["GET"])
 @login_required
 def get_recurring_rules():
     db = get_db()
@@ -1175,7 +1406,7 @@ def get_recurring_rules():
     return jsonify([dict(r) for r in rows])
 
 
-@app.route("/api/recurring", methods=["POST"])
+@app.route("/api/v1/recurring", methods=["POST"])
 @login_required
 @role_required("Admin", "Accountant")
 def create_recurring_rule():
@@ -1204,7 +1435,7 @@ def create_recurring_rule():
     return jsonify({"id": cur.lastrowid}), 201
 
 
-@app.route("/api/recurring/<int:rule_id>", methods=["DELETE"])
+@app.route("/api/v1/recurring/<int:rule_id>", methods=["DELETE"])
 @login_required
 @role_required("Admin", "Accountant")
 def delete_recurring_rule(rule_id):
@@ -1237,7 +1468,7 @@ def advance_date(date_str, frequency):
     return date_str
 
 
-@app.route("/api/recurring/run", methods=["POST"])
+@app.route("/api/v1/recurring/run", methods=["POST"])
 @login_required
 @role_required("Admin", "Accountant")
 def run_recurring_invoices():
@@ -1287,7 +1518,7 @@ def run_recurring_invoices():
 # the model (or here, simple keyword matching) only ever picks WHICH
 # pre-approved query to run, never WHAT SQL to run.
 # ---------------------------------------------------------------
-@app.route("/api/assistant/ask", methods=["POST"])
+@app.route("/api/v1/assistant/ask", methods=["POST"])
 @login_required
 def ask_assistant():
     data = request.get_json(force=True)
@@ -1357,7 +1588,7 @@ def ask_assistant():
 # so swapping this function for a trained model later (e.g. scikit-learn
 # logistic regression) wouldn't require changing anything else.
 # ---------------------------------------------------------------
-@app.route("/api/customers/<int:customer_id>/risk-score", methods=["GET"])
+@app.route("/api/v1/customers/<int:customer_id>/risk-score", methods=["GET"])
 @login_required
 def get_customer_risk_score(customer_id):
     db = get_db()
@@ -1402,7 +1633,7 @@ def get_customer_risk_score(customer_id):
 # ---------------------------------------------------------------
 # CSV / PDF export (unchanged from before)
 # ---------------------------------------------------------------
-@app.route("/api/invoices/export", methods=["GET"])
+@app.route("/api/v1/invoices/export", methods=["GET"])
 @login_required
 def export_invoices_csv():
     db = get_db()

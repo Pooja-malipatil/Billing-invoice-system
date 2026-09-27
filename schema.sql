@@ -172,6 +172,24 @@ CREATE TABLE IF NOT EXISTS recurring_rules (
     FOREIGN KEY (customer_id) REFERENCES customers(id)
 );
 
+-- 10) INVOICE VERSIONS -----------------------------------------------------
+-- Snapshot of an invoice's state BEFORE each edit, so you can always answer
+-- "what did this invoice look like before, and who changed it, and when."
+CREATE TABLE IF NOT EXISTS invoice_versions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    invoice_id      INTEGER NOT NULL,
+    version_number  INTEGER NOT NULL,
+    changed_by      TEXT NOT NULL,   -- username, denormalized like audit_log
+    subtotal        REAL NOT NULL,
+    tax_amount      REAL NOT NULL,
+    total           REAL NOT NULL,
+    status          TEXT NOT NULL,
+    invoice_date    TEXT NOT NULL,
+    due_date        TEXT NOT NULL,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_customers_org ON customers(org_id);
 CREATE INDEX IF NOT EXISTS idx_products_org ON products(org_id);
 CREATE INDEX IF NOT EXISTS idx_recurring_org ON recurring_rules(org_id);

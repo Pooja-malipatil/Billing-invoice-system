@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Assistant - BillDesk{% endblock %}
+{% block content %}
+  <h1>Business Assistant</h1>
+  <p class="subtitle">Ask about your business data. Answers come from your real records via safe, predefined queries - not free-form SQL.</p>
+
+  <div class="assistant-box">
+    <div class="assistant-messages" id="assistant-messages"></div>
+    <div class="assistant-input-row">
+      <input type="text" id="assistant-input" placeholder="e.g. Which customers have overdue payments?">
+      <button class="btn btn-primary" id="btn-ask">Ask</button>
+    </div>
+    <div class="assistant-suggestions">
+      <button class="suggestion-chip" data-q="Which customers have overdue payments?">Overdue payments</button>
+      <button class="suggestion-chip" data-q="What was our revenue this month?">Revenue this month</button>
+      <button class="suggestion-chip" data-q="Which product generated the most revenue?">Top product</button>
+      <button class="suggestion-chip" data-q="Show invoices above 10000">Invoices above ₹10,000</button>
+    </div>
+  </div>
+{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', filename='js/assistant.js') }}"></script>{% endblock %}

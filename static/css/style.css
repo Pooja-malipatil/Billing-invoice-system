@@ -62,3 +62,48 @@ input, select, textarea { font-family: inherit; padding: 9px 12px; border: 1px s
 .auth-error { background: #fee2e2; color: var(--danger); padding: 8px 12px; border-radius: var(--radius); font-size: 0.85rem; margin-bottom: 16px; }
 .auth-switch { text-align: center; margin-top: 16px; font-size: 0.85rem; color: var(--text-muted); }
 .auth-switch a { color: var(--primary); font-weight: 600; text-decoration: none; }
+
+/* ---------- Notification bell ---------- */
+.notif-bell { position: relative; cursor: pointer; font-size: 1.1rem; margin-left: 20px; }
+.notif-badge {
+  position: absolute; top: -6px; right: -10px; background: var(--danger); color: #fff;
+  font-size: 0.65rem; font-weight: 700; padding: 1px 5px; border-radius: 999px; min-width: 16px; text-align: center;
+}
+.notif-dropdown {
+  position: absolute; right: 32px; top: 56px; width: 320px; max-height: 400px; overflow-y: auto;
+  background: var(--card-bg); border: 1px solid var(--border); border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(0,0,0,0.12); z-index: 20;
+}
+.notif-item { padding: 12px 16px; border-bottom: 1px solid var(--border); font-size: 0.85rem; cursor: pointer; }
+.notif-item:last-child { border-bottom: none; }
+.notif-item.unread { background: #eff6ff; }
+.notif-type { font-size: 0.7rem; text-transform: uppercase; color: var(--primary); font-weight: 700; }
+.notif-item p { margin: 4px 0; }
+.notif-time { font-size: 0.72rem; color: var(--text-muted); }
+
+/* ---------- Risk badge ---------- */
+.risk-Low { color: var(--success); font-weight: 600; }
+.risk-Medium { color: var(--warning); font-weight: 600; }
+.risk-High { color: var(--danger); font-weight: 600; }
+
+/* ---------- Assistant chat ---------- */
+.assistant-box { background: var(--card-bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; }
+.assistant-messages { display: flex; flex-direction: column; gap: 12px; margin-bottom: 16px; min-height: 100px; }
+.assistant-msg { padding: 10px 14px; border-radius: var(--radius); max-width: 80%; font-size: 0.9rem; }
+.assistant-msg.user { background: var(--primary); color: #fff; align-self: flex-end; }
+.assistant-msg.bot { background: #f0f2f5; align-self: flex-start; }
+.assistant-input-row { display: flex; gap: 10px; }
+.assistant-input-row input { flex: 1; }
+.assistant-suggestions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.suggestion-chip {
+  background: #eef0f4; border: none; border-radius: 999px; padding: 6px 14px;
+  font-size: 0.8rem; cursor: pointer; color: var(--text);
+}
+.suggestion-chip:hover { background: #e2e5eb; }
+
+/* ---------- Ledger verify box ---------- */
+.ledger-verify {
+  margin: 16px 0; padding: 14px 18px; border-radius: var(--radius); font-size: 0.9rem; font-weight: 600;
+}
+.ledger-verify.ok { background: #dcfce7; color: var(--success); }
+.ledger-verify.error { background: #fee2e2; color: var(--danger); }

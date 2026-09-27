@@ -9,8 +9,8 @@ async function loadInvoices() {
   if (searchInput.value.trim()) params.set("search", searchInput.value.trim());
   if (statusSelect.value) params.set("status", statusSelect.value);
   try {
-    const data = await apiFetch(`/api/invoices?${params.toString()}`);
-    renderInvoices(data.invoices);  // API now returns {invoices, page, total_pages, ...} for pagination
+    const data = await apiFetch(`/api/v1/invoices?${params.toString()}`);
+    renderInvoices(data.invoices);
   } catch (err) { showToast(err.message, true); }
 }
 function renderInvoices(invoices) {
@@ -29,12 +29,12 @@ function renderInvoices(invoices) {
   tbody.querySelectorAll("[data-delete]").forEach((btn) => btn.addEventListener("click", () => deleteInvoice(btn.dataset.delete)));
 }
 async function markPaid(id) {
-  try { await apiFetch(`/api/invoices/${id}/status`, { method: "PATCH", body: JSON.stringify({ status: "Paid" }) }); showToast("Invoice marked as paid"); loadInvoices(); }
+  try { await apiFetch(`/api/v1/invoices/${id}/status`, { method: "PATCH", body: JSON.stringify({ status: "Paid" }) }); showToast("Invoice marked as paid"); loadInvoices(); }
   catch (err) { showToast(err.message, true); }
 }
 async function deleteInvoice(id) {
   if (!confirm("Delete this invoice? This cannot be undone.")) return;
-  try { await apiFetch(`/api/invoices/${id}`, { method: "DELETE" }); showToast("Invoice deleted"); loadInvoices(); }
+  try { await apiFetch(`/api/v1/invoices/${id}`, { method: "DELETE" }); showToast("Invoice deleted"); loadInvoices(); }
   catch (err) { showToast(err.message, true); }
 }
 searchInput.addEventListener("input", () => { clearTimeout(debounceTimer); debounceTimer = setTimeout(loadInvoices, 300); });
@@ -43,6 +43,6 @@ document.getElementById("btn-export-csv").addEventListener("click", () => {
   const params = new URLSearchParams();
   if (searchInput.value.trim()) params.set("search", searchInput.value.trim());
   if (statusSelect.value) params.set("status", statusSelect.value);
-  window.location.href = `/api/invoices/export?${params.toString()}`;
+  window.location.href = `/api/v1/invoices/export?${params.toString()}`;
 });
 loadInvoices();

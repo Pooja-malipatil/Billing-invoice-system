@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}Products - BillDesk{% endblock %}
+{% block content %}
+  <div class="page-header">
+    <h1>Products</h1>
+    <button class="btn btn-primary" id="btn-new-product">+ Add Product</button>
+  </div>
+  <table class="data-table">
+    <thead><tr><th>SKU</th><th>Name</th><th>Price</th><th>Stock</th><th>Status</th><th></th></tr></thead>
+    <tbody id="products-tbody"></tbody>
+  </table>
+  <p id="products-empty" class="empty-state" style="display:none;">No products yet. Add your first one above.</p>
+
+  <div id="product-modal" class="modal-overlay" style="display:none;">
+    <div class="modal">
+      <h2 id="product-modal-title">Add Product</h2>
+      <form id="product-form">
+        <input type="hidden" id="product-id">
+        <label>Name *<input type="text" id="product-name" required></label>
+        <label>SKU *<input type="text" id="product-sku" required></label>
+        <label>Description<textarea id="product-description" rows="2"></textarea></label>
+        <label>Price *<input type="number" id="product-price" min="0" step="0.01" required></label>
+        <label>Tax %<input type="number" id="product-tax" min="0" step="0.01" value="0"></label>
+        <label id="stock-field">Starting Stock<input type="number" id="product-stock" min="0" value="0"></label>
+        <label>Low Stock Threshold<input type="number" id="product-threshold" min="0" value="5"></label>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-secondary" id="btn-cancel-product">Cancel</button>
+          <button type="submit" class="btn btn-primary">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="stock-modal" class="modal-overlay" style="display:none;">
+    <div class="modal">
+      <h2>Adjust Stock</h2>
+      <form id="stock-form">
+        <input type="hidden" id="stock-product-id">
+        <label>Change Amount (use negative to reduce) *<input type="number" id="stock-change" required></label>
+        <label>Reason<input type="text" id="stock-reason" placeholder="e.g. Restocked from supplier"></label>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-secondary" id="btn-cancel-stock">Cancel</button>
+          <button type="submit" class="btn btn-primary">Apply</button>
+        </div>
+      </form>
+    </div>
+  </div>
+{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', filename='js/products.js') }}"></script>{% endblock %}

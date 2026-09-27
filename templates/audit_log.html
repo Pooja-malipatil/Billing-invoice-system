@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}Audit Log - BillDesk{% endblock %}
+{% block content %}
+  <h1>Audit Log</h1>
+  <p class="subtitle">Every sensitive action in your organization, in order. Admin only.</p>
+  <table class="data-table">
+    <thead><tr><th>When</th><th>Who</th><th>Action</th><th>Details</th></tr></thead>
+    <tbody id="audit-tbody"></tbody>
+  </table>
+  <p id="audit-empty" class="empty-state" style="display:none;">No activity recorded yet.</p>
+{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', filename='js/audit_log.js') }}"></script>{% endblock %}

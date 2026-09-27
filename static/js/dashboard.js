@@ -1,6 +1,6 @@
 async function loadDashboard() {
   try {
-    const stats = await apiFetch("/api/dashboard");
+    const stats = await apiFetch("/api/v1/dashboard");
     document.getElementById("stat-revenue").textContent = formatCurrency(stats.total_revenue);
     document.getElementById("stat-pending").textContent = formatCurrency(stats.total_pending);
     document.getElementById("stat-overdue-count").textContent = stats.overdue_count;

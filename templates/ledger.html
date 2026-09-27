@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Ledger - BillDesk{% endblock %}
+{% block content %}
+  <h1>Financial Ledger</h1>
+  <p class="subtitle">Real double-entry bookkeeping - every rupee owed or received is tracked as a matched debit and credit. Nothing here is a stored balance; every number is calculated live from the entries below.</p>
+
+  <div class="cards">
+    <div class="card total"><span class="card-label">Accounts Receivable (owed to you)</span><span class="card-value" id="bal-ar">—</span></div>
+    <div class="card revenue"><span class="card-label">Cash Received</span><span class="card-value" id="bal-cash">—</span></div>
+    <div class="card pending"><span class="card-label">Recognized Revenue</span><span class="card-value" id="bal-revenue">—</span></div>
+  </div>
+
+  <div class="ledger-verify" id="ledger-verify">Checking ledger balance…</div>
+
+  <h2>Recent Entries</h2>
+  <table class="data-table">
+    <thead><tr><th>When</th><th>Invoice</th><th>Type</th><th>Account</th><th>Amount</th><th>Description</th></tr></thead>
+    <tbody id="ledger-tbody"></tbody>
+  </table>
+  <p id="ledger-empty" class="empty-state" style="display:none;">No ledger entries yet - create and issue an invoice to see one.</p>
+{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', filename='js/ledger.js') }}"></script>{% endblock %}
